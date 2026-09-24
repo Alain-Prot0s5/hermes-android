@@ -67,6 +67,11 @@ android {
            }
        }
    }
+
+   dependenciesInfo {
+       includeInApk = false
+       includeInBundle = false
+   }
 }
 
 kotlin {

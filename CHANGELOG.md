@@ -4,6 +4,13 @@ All notable changes to this project are documented here. This project adheres to
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html). Release notes for
 versions prior to 1.0.7 are in the **What's new** sections of the [README](README.md).
 
+## [2.1.5] - 2026-09-24
+
+### Changed
+
+- Android release APKs and app bundles no longer embed dependency metadata,
+  matching F-Droid's build requirements.
+
 ## [2.1.4] - 2026-09-23
 
 ### Fixed
