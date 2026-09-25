@@ -38,6 +38,38 @@ class _BlockingStreamingClient extends http.BaseClient {
   }
 }
 
+class _PreHeaderHangingClient extends http.BaseClient {
+  final Completer<void> requestStarted = Completer<void>();
+  final Completer<void> releaseRequest = Completer<void>();
+  http.BaseRequest? request;
+  bool abortObserved = false;
+  bool closed = false;
+
+  @override
+  Future<http.StreamedResponse> send(http.BaseRequest request) async {
+    this.request = request;
+    if (!requestStarted.isCompleted) requestStarted.complete();
+    if (request is http.AbortableRequest && request.abortTrigger != null) {
+      await Future.any<void>([
+        request.abortTrigger!.then((_) {
+          abortObserved = true;
+          throw http.RequestAbortedException(request.url);
+        }),
+        releaseRequest.future,
+      ]);
+    } else {
+      await releaseRequest.future;
+    }
+    return http.StreamedResponse(const Stream<List<int>>.empty(), 200);
+  }
+
+  @override
+  void close() {
+    closed = true;
+    if (!releaseRequest.isCompleted) releaseRequest.complete();
+  }
+}
+
 /// Returns a FRESH stream controller per request so a test can keep the
 /// first response's stream alive while a second send starts.
 class _MultiStreamingClient extends http.BaseClient {
@@ -734,6 +766,58 @@ void main() {
     );
 
     test(
+      'cancels promptly while SSE response headers are still pending',
+      () async {
+        final transport = _PreHeaderHangingClient();
+        final api = ApiClient(
+          baseUrl: 'http://hermes.local:8642',
+          apiKey: _raceKey,
+          httpClient: transport,
+        );
+        final gateway = GatewayChatClient(api);
+        var done = false;
+        String? error;
+
+        final sending = gateway.sendMessageStreaming(
+          message: 'waiting for headers',
+          sessionId: 'mob-pre-header-cancel',
+          onToken: (_) {},
+          onDone: () => done = true,
+          onError: (value) => error = value,
+        );
+        await transport.requestStarted.future;
+
+        expect(await gateway.cancelActiveMessage(), isTrue);
+        Object? settleFailure;
+        try {
+          await sending.timeout(const Duration(milliseconds: 250));
+        } catch (failure) {
+          settleFailure = failure;
+        }
+        if (!transport.releaseRequest.isCompleted) {
+          transport.releaseRequest.complete();
+        }
+        await sending;
+
+        expect(transport.request, isA<http.AbortableRequest>());
+        expect(transport.abortObserved, isTrue);
+        expect(
+          settleFailure,
+          isNull,
+          reason: 'cancellation must not wait for response headers',
+        );
+        expect(
+          transport.closed,
+          isFalse,
+          reason: 'cancelling one send must keep the shared client usable',
+        );
+        expect(done, isFalse);
+        expect(error, isNull);
+        api.close();
+      },
+    );
+
+    test(
       'cancel-then-resend never reports the cancelled turn as done and '
       'never leaks its tokens into the new stream',
       () async {
@@ -884,6 +968,83 @@ void main() {
       expect(DashboardClient.buildCronUpdateBody(updates), {
         'updates': updates,
       });
+    });
+
+    test('scopes every cron operation to the connection profile', () async {
+      final requests = <http.Request>[];
+      final client = DashboardClient(
+        host: 'hermes.local',
+        port: 9119,
+        proxied: true,
+        gatewayProfile: 'research',
+        httpClient: MockClient((request) async {
+          requests.add(request);
+          if (request.url.path == '/api/cron/jobs') {
+            if (request.method == 'GET') return http.Response('[]', 200);
+            return http.Response('{"id":"job-1"}', 200);
+          }
+          if (request.url.path.endsWith('/runs')) {
+            return http.Response('{"runs":[],"limit":20}', 200);
+          }
+          return http.Response('{}', 200);
+        }),
+      );
+
+      await client.getCronJobs();
+      await client.getCronJobRuns('job-1');
+      await client.createJob(
+        name: 'Scoped job',
+        prompt: 'Do scoped work',
+        schedule: '0 9 * * *',
+      );
+      await client.updateJob('job-1', {'name': 'Updated'});
+      await client.setJobPaused('job-1', paused: true);
+      await client.setJobPaused('job-1', paused: false);
+      await client.triggerJob('job-1');
+      await client.deleteJob('job-1');
+
+      expect(requests, hasLength(8));
+      for (final request in requests) {
+        expect(
+          request.url.queryParameters['profile'],
+          'research',
+          reason:
+              '${request.method} ${request.url.path} must stay profile-scoped',
+        );
+      }
+      expect(requests[1].url.queryParameters['limit'], '20');
+      expect(jsonDecode(requests[2].body), {
+        'prompt': 'Do scoped work',
+        'schedule': '0 9 * * *',
+        'name': 'Scoped job',
+        'deliver': 'local',
+      });
+      expect(jsonDecode(requests[3].body), {
+        'updates': {'name': 'Updated'},
+      });
+      expect(requests[4].url.path, '/api/cron/jobs/job-1/pause');
+      expect(requests[5].url.path, '/api/cron/jobs/job-1/resume');
+      expect(requests[6].url.path, '/api/cron/jobs/job-1/trigger');
+      expect(requests[7].method, 'DELETE');
+      client.close();
+    });
+
+    test('updateJob times out when response headers never arrive', () async {
+      final never = Completer<http.Response>();
+      final client = DashboardClient(
+        host: 'hermes.local',
+        port: 9119,
+        proxied: true,
+        httpClient: MockClient((_) => never.future),
+      );
+
+      await expectLater(
+        client.updateJob('job-1', {
+          'name': 'Still bounded',
+        }, timeout: const Duration(milliseconds: 25)),
+        throwsA(isA<TimeoutException>()),
+      );
+      client.close();
     });
 
     test('getCronJobRuns parses the dashboard runs envelope', () async {
@@ -1379,6 +1540,73 @@ void main() {
       expect(loginCalls, 2);
       client.close();
     });
+
+    test(
+      'concurrent stale 401 responses share one replacement login',
+      () async {
+        var loginCalls = 0;
+        var staleApiCalls = 0;
+        var apiCalls = 0;
+        final bothStaleRequestsStarted = Completer<void>();
+        final releaseReplacementLogin = Completer<void>();
+        final client = DashboardClient(
+          host: 'hermes.local',
+          port: 30433,
+          username: 'misha',
+          password: 'secret',
+          httpClient: MockClient((request) async {
+            if (request.url.path == '/auth/password-login') {
+              loginCalls++;
+              if (loginCalls == 2) {
+                Future<void>.delayed(const Duration(milliseconds: 25), () {
+                  if (!releaseReplacementLogin.isCompleted) {
+                    releaseReplacementLogin.complete();
+                  }
+                });
+                await releaseReplacementLogin.future;
+              }
+              return http.Response(
+                '{"ok":true}',
+                200,
+                headers: {
+                  'set-cookie':
+                      'hermes_session_at=TOK$loginCalls; Path=/; HttpOnly',
+                },
+              );
+            }
+            if (request.url.path.startsWith('/api/')) {
+              apiCalls++;
+              if (_header(request, 'cookie') == 'hermes_session_at=TOK1') {
+                staleApiCalls++;
+                if (staleApiCalls == 2 &&
+                    !bothStaleRequestsStarted.isCompleted) {
+                  bothStaleRequestsStarted.complete();
+                }
+                await bothStaleRequestsStarted.future;
+                return http.Response('unauthorized', 401);
+              }
+              return http.Response('{"ok":true}', 200);
+            }
+            return http.Response('not found', 404);
+          }),
+        );
+
+        final results = await Future.wait([
+          client.apiGet('first'),
+          client.apiGet('second'),
+        ]);
+
+        expect(results, everyElement({'ok': true}));
+        expect(staleApiCalls, 2);
+        expect(apiCalls, 4, reason: 'each request retries at most once');
+        expect(
+          loginCalls,
+          2,
+          reason: 'initial login plus one shared replacement login',
+        );
+        client.close();
+      },
+    );
 
     test('surfaces invalid dashboard credentials', () async {
       final client = DashboardClient(
