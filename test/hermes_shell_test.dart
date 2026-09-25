@@ -76,6 +76,30 @@ void main() {
       expect(find.text('pane:projects'), findsNothing);
     });
 
+    testWidgets('builds destination panes lazily', (tester) async {
+      final built = <HermesDestination>[];
+      await tester.pumpWidget(
+        MaterialApp(
+          theme: hermesTheme(Brightness.dark),
+          home: HermesShell(
+            builder: (context, destination) {
+              built.add(destination);
+              return Text('pane:${destination.name}');
+            },
+          ),
+        ),
+      );
+      await tester.pumpAndSettle();
+
+      expect(built.toSet(), {HermesDestination.home});
+
+      await tester.tap(find.text(HermesDestination.chats.label));
+      await tester.pumpAndSettle();
+
+      expect(built.toSet(), {HermesDestination.home, HermesDestination.chats});
+      expect(built, isNot(contains(HermesDestination.projects)));
+    });
+
     testWidgets('opens on any requested destination', (tester) async {
       await _pumpShell(tester, initial: HermesDestination.activity);
 

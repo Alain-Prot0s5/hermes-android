@@ -208,6 +208,12 @@ class ProjectsRepository {
 
   final _controller = StreamController<ProjectsView>.broadcast();
   ProjectsView _current = ProjectsView.empty;
+  int _pendingCreateSequence = 0;
+
+  /// Serializes cache writes without serializing the network mutations that
+  /// produce them. Concurrent creates remain concurrent, while the newest
+  /// reconciled snapshot is guaranteed to be persisted last.
+  Future<void> _cacheWriteTail = Future<void>.value();
 
   /// Last good drill-in per project, so re-entering one opens with content.
   final _sessionsCache = <String, ProjectSessionsView>{};
@@ -299,21 +305,22 @@ class ProjectsRepository {
   Future<HermesProject> create(String name, {bool select = false}) async {
     _requireSupported();
     final trimmed = name.trim();
-    final previous = _current;
+    final pendingSequence = _pendingCreateSequence++;
     final placeholder = HermesProject(
-      id: 'pending:${DateTime.now().microsecondsSinceEpoch}',
+      id: 'pending:${DateTime.now().microsecondsSinceEpoch}:$pendingSequence',
       slug: trimmed.toLowerCase().replaceAll(RegExp(r'\s+'), '-'),
       name: trimmed,
     );
     _emit(
-      previous.copyWith(
-        projects: [...previous.projects, placeholder],
+      _current.copyWith(
+        projects: [..._current.projects, placeholder],
         clearError: true,
       ),
     );
 
+    late HermesProject created;
     try {
-      var created = await client.create(name: trimmed, use: select);
+      created = await client.create(name: trimmed, use: select);
       if (created.folders.isEmpty && folderProvisioner != null) {
         // Name-only create: give the Project a folder it owns outright.
         // A provisioning or bind failure must not undo the create — the
@@ -331,18 +338,47 @@ class ProjectsRepository {
           } catch (_) {}
         }
       }
-      final view = previous.copyWith(
-        projects: [...previous.projects, created],
-        activeId: select ? created.id : null,
-        clearError: true,
-      );
-      await _writeCache(view);
-      _emit(view);
-      return created;
     } catch (_) {
-      _emit(previous);
+      // Remove only this request's placeholder. Rolling back to the snapshot
+      // captured at request start would erase sibling creates that completed
+      // while this request was in flight.
+      _emit(
+        _current.copyWith(
+          projects: [
+            for (final project in _current.projects)
+              if (project.id != placeholder.id) project,
+          ],
+        ),
+      );
       rethrow;
     }
+
+    // Reconcile against the latest state, not the snapshot captured when the
+    // request started. Another create may have completed while this one was in
+    // flight; replacing only our own placeholder preserves that server record
+    // and any still-pending siblings. If a refresh already surfaced [created],
+    // replace it in place instead of duplicating it.
+    final projects = <HermesProject>[];
+    var createdAlreadyPresent = false;
+    for (final project in _current.projects) {
+      if (project.id == placeholder.id) continue;
+      if (project.id == created.id) {
+        projects.add(created);
+        createdAlreadyPresent = true;
+      } else {
+        projects.add(project);
+      }
+    }
+    if (!createdAlreadyPresent) projects.add(created);
+
+    final view = _current.copyWith(
+      projects: projects,
+      activeId: select ? created.id : null,
+      clearError: true,
+    );
+    _emit(view);
+    await _queueCacheWrite(view);
+    return created;
   }
 
   Future<HermesProject> rename(String id, String name) async {
@@ -802,6 +838,15 @@ class ProjectsRepository {
       'active_id': view.activeId,
     });
     await preferences.setString(_cacheKey, payload);
+  }
+
+  Future<void> _queueCacheWrite(ProjectsView view) {
+    final write = _cacheWriteTail.then((_) => _writeCache(view));
+    _cacheWriteTail = write.then<void>(
+      (_) {},
+      onError: (Object _, StackTrace _) {},
+    );
+    return write;
   }
 
   static Map<String, dynamic> _projectToJson(HermesProject project) => {

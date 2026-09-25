@@ -3,6 +3,7 @@ import 'package:flutter_test/flutter_test.dart';
 import 'package:hermes_android/core/models/session.dart';
 import 'package:hermes_android/core/screens/workspace_sessions_screen.dart';
 import 'package:hermes_android/core/theme/hermes_theme.dart';
+import 'package:hermes_android/core/widgets/hermes_components.dart';
 
 Session _session(
   String id,
@@ -453,7 +454,10 @@ void main() {
             archivedQuickChatIds: const {'s1'},
           ),
           onOpenSession: (session) => opened.add(session.id),
-          onPromote: (session) async => promoted.add(session.id),
+          onPromote: (session) async {
+            promoted.add(session.id);
+            return 'Project';
+          },
         ),
       ),
     );
@@ -485,7 +489,10 @@ void main() {
             sessions: [_session('s1', 'Loose chat'), _session('s2', 'Also loose')],
           ),
           onOpenSession: (_) {},
-          onPromote: (session) async => moved.add(session.id),
+          onPromote: (session) async {
+            moved.add(session.id);
+            return 'Project';
+          },
         ),
       ),
     );
@@ -500,5 +507,58 @@ void main() {
     // the other stays.
     expect(find.text('Loose chat'), findsNothing);
     expect(find.text('Also loose'), findsOneWidget);
+  });
+
+  testWidgets('moving a chat updates its project label before showing All', (
+    tester,
+  ) async {
+    await tester.pumpWidget(
+      MaterialApp(
+        theme: hermesTheme(Brightness.dark),
+        home: Scaffold(
+          body: WorkspaceSessionsScreen(
+            title: 'Chats',
+            view: WorkspaceSessionView.all,
+            embedded: true,
+            load: () async => WorkspaceSessionsData(
+              sessions: [_session('s1', 'Loose chat')],
+              archivedSessions: [
+                _session('s2', 'Archived chat', archived: true),
+              ],
+            ),
+            onOpenSession: (_) {},
+            onPromote: (_) async => 'Hermes Android',
+          ),
+        ),
+      ),
+    );
+    await tester.pumpAndSettle();
+
+    await tester.tap(find.widgetWithText(ChoiceChip, 'Unassigned'));
+    await tester.pumpAndSettle();
+    await tester.tap(find.byTooltip('Move to project'));
+    await tester.pumpAndSettle();
+    expect(find.text('Loose chat'), findsNothing);
+
+    await tester.tap(find.widgetWithText(ChoiceChip, 'All'));
+    await tester.pumpAndSettle();
+
+    final row = find.ancestor(
+      of: find.text('Loose chat'),
+      matching: find.byType(HermesCard),
+    );
+    expect(row, findsOneWidget);
+    expect(
+      find.descendant(of: row, matching: find.text('Hermes Android')),
+      findsOneWidget,
+    );
+    expect(
+      find.descendant(of: row, matching: find.text('Unassigned')),
+      findsNothing,
+    );
+
+    await tester.tap(find.widgetWithText(ChoiceChip, 'Archived'));
+    await tester.pumpAndSettle();
+    expect(find.text('Archived chat'), findsOneWidget);
   });
 }

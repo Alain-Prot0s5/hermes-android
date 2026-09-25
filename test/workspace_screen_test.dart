@@ -307,6 +307,42 @@ void main() {
     expect(opened, ['s1']);
   });
 
+  testWidgets('Chats keeps its selected filter after switching away and back', (
+    tester,
+  ) async {
+    await _pump(
+      tester,
+      connection: _connection(desktopGatewayUrl: 'https://host:8642'),
+      repository: await _repository([]),
+      sessions: [_session(id: 's1', title: 'Loose chat')],
+    );
+    await tester.pumpAndSettle();
+
+    await tester.tap(find.text(HermesDestination.chats.label).last);
+    await tester.pumpAndSettle();
+    await tester.tap(find.widgetWithText(ChoiceChip, 'Unassigned'));
+    await tester.pumpAndSettle();
+    expect(
+      tester.widget<ChoiceChip>(
+        find.widgetWithText(ChoiceChip, 'Unassigned'),
+      ).selected,
+      isTrue,
+    );
+
+    await tester.tap(find.text(HermesDestination.home.label).last);
+    await tester.pumpAndSettle();
+    await tester.tap(find.text(HermesDestination.chats.label).last);
+    await tester.pumpAndSettle();
+
+    expect(
+      tester.widget<ChoiceChip>(
+        find.widgetWithText(ChoiceChip, 'Unassigned'),
+      ).selected,
+      isTrue,
+    );
+    expect(find.text('Loose chat'), findsOneWidget);
+  });
+
   testWidgets('Chats rows show the project label from the server tree', (
     tester,
   ) async {

@@ -180,7 +180,11 @@ class WorkspaceSessionsData {
 }
 
 typedef WorkspaceSessionsLoader = Future<WorkspaceSessionsData> Function();
-typedef WorkspaceSessionPromoter = Future<void> Function(Session session);
+
+/// Moves a session and returns the destination Project label. Returning the
+/// label lets the row update ownership and presentation in one state change,
+/// without waiting for a second projects.tree request.
+typedef WorkspaceSessionPromoter = Future<String> Function(Session session);
 
 class QuickChatPromotionCancelled implements Exception {
   const QuickChatPromotionCancelled();
@@ -298,7 +302,7 @@ class _WorkspaceSessionsScreenState extends State<WorkspaceSessionsScreen> {
     if (promote == null || _promoting.contains(session.id)) return;
     setState(() => _promoting.add(session.id));
     try {
-      await promote(session);
+      final projectLabel = await promote(session);
       if (!mounted) return;
       final data = _data;
       if (data != null) {
@@ -316,7 +320,13 @@ class _WorkspaceSessionsScreenState extends State<WorkspaceSessionsScreen> {
               for (final id in data.archivedQuickChatIds)
                 if (id != session.id) id,
             },
-            projectLabels: data.projectLabels,
+            // Ownership and its visible label are one piece of state. Updating
+            // only claimedSessionIds made the row disappear from Unassigned,
+            // then show "Unassigned" when All was selected immediately.
+            projectLabels: {
+              ...data.projectLabels,
+              session.id: projectLabel,
+            },
             archivedSessions: data.archivedSessions,
             projectsKnown: data.projectsKnown,
           );

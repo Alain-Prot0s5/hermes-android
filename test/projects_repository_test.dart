@@ -1,3 +1,5 @@
+import 'dart:async';
+
 import 'package:flutter_test/flutter_test.dart';
 import 'package:hermes_android/core/services/chat_space_store.dart';
 import 'package:hermes_android/core/services/project_folder_provisioner.dart';
@@ -321,6 +323,71 @@ void main() {
         expect(seen.first, ['ScriptHive']);
         expect(repo.current.projects.single.id, 'srv-1');
         expect(repo.current.projects.single.name, 'ScriptHive');
+      },
+    );
+
+    test(
+      'concurrent creates keep both server records and remove placeholders',
+      () async {
+        final creates = <Completer<Map<String, dynamic>>>[];
+        final repo = ProjectsRepository(
+          client: ProjectsGatewayClient((method, params) async {
+            if (method == 'projects.list') {
+              return _FakeGateway._ok({
+                'projects': const <Map<String, dynamic>>[],
+                'active_id': null,
+              });
+            }
+            if (method == 'projects.create') {
+              final response = Completer<Map<String, dynamic>>();
+              creates.add(response);
+              return response.future;
+            }
+            return _FakeGateway._ok(const {});
+          }),
+          preferences: await SharedPreferences.getInstance(),
+          connectionId: 'gateway-a',
+        );
+        await repo.refresh();
+
+        final first = repo.create('First');
+        final second = repo.create('Second');
+
+        expect(creates, hasLength(2));
+        expect(repo.current.projects.map((project) => project.name), [
+          'First',
+          'Second',
+        ]);
+        expect(
+          repo.current.projects.every(
+            (project) => project.id.startsWith('pending:'),
+          ),
+          isTrue,
+        );
+
+        creates[0].complete(
+          _FakeGateway._ok({
+            'project': _projectJson(id: 'srv-1', name: 'First'),
+          }),
+        );
+        await first;
+        creates[1].complete(
+          _FakeGateway._ok({
+            'project': _projectJson(id: 'srv-2', name: 'Second'),
+          }),
+        );
+        await second;
+
+        expect(repo.current.projects.map((project) => project.id).toSet(), {
+          'srv-1',
+          'srv-2',
+        });
+        expect(
+          repo.current.projects.where(
+            (project) => project.id.startsWith('pending:'),
+          ),
+          isEmpty,
+        );
       },
     );
 
