@@ -4,6 +4,19 @@ All notable changes to this project are documented here. This project adheres to
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html). Release notes for
 versions prior to 1.0.7 are in the **What's new** sections of the [README](README.md).
 
+## [2.1.6] - 2026-09-26
+
+### Fixed
+
+- Android now trusts certificate authorities that the device user explicitly
+  installed, allowing private Caddy and Tailscale reverse proxies to reach the
+  Hermes Gateway while retaining normal system certificate validation (#108).
+
+### Thanks
+
+- @spsDrop for reporting the private-CA connection failure and confirming the
+  affected Caddy/Tailscale setup (#108).
+
 ## [2.1.5] - 2026-09-24
 
 ### Changed
