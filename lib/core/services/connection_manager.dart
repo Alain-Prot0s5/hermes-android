@@ -611,6 +611,14 @@ class ApiHealthCheckResult {
   }
 }
 
+/// One page of the gateway's session list with its paging signal.
+class SessionListPage {
+  final List<Session> sessions;
+  final bool hasMore;
+
+  const SessionListPage({required this.sessions, required this.hasMore});
+}
+
 /// HTTP client for the Hermes Gateway API Server (port 8642).
 ///
 /// Uses Bearer token auth. Same pattern as hermes-desktop.
@@ -655,28 +663,49 @@ class ApiClient {
 
   // ── Session listing ──────────────────────────────────────────────────
 
-  Future<List<Session>> getSessions({Duration timeout = requestTimeout}) async {
-    final res = await _http
-        .get(Uri.parse('$baseUrl/api/sessions'), headers: _headers)
-        .timeout(timeout);
+  /// One page of the gateway session list plus the server's paging signal.
+  ///
+  /// The gateway api_server caps `limit` at 200 and reports `has_more` from
+  /// its recency window, so a client that never pages only ever sees the
+  /// most recent page — which silently truncated the Unassigned bucket
+  /// (sessions outside the first page never reached the device).
+  Future<SessionListPage> getSessionsPage({
+    int limit = 50,
+    int offset = 0,
+    Duration timeout = requestTimeout,
+  }) async {
+    final uri = Uri.parse(
+      '$baseUrl/api/sessions',
+    ).replace(queryParameters: {'limit': '$limit', 'offset': '$offset'});
+    final res = await _http.get(uri, headers: _headers).timeout(timeout);
     if (res.statusCode != 200) {
       throw Exception('HTTP ${res.statusCode}: ${res.body}');
     }
     final data = jsonDecode(res.body) as Map<String, dynamic>;
     final list = data['data'] as List? ?? [];
-    return list
-        .whereType<Map<String, dynamic>>()
-        .map((s) => Session.fromJson(s))
-        .toList();
+    return SessionListPage(
+      sessions: list
+          .whereType<Map<String, dynamic>>()
+          .map((s) => Session.fromJson(s))
+          .toList(),
+      hasMore: data['has_more'] == true,
+    );
+  }
+
+  Future<List<Session>> getSessions({Duration timeout = requestTimeout}) async {
+    final page = await getSessionsPage(timeout: timeout);
+    return page.sessions;
   }
 
   // ── Messages ─────────────────────────────────────────────────────────
 
   Future<List<Map<String, dynamic>>> getMessages(String sessionId) async {
-    final res = await _http.get(
-      Uri.parse('$baseUrl/api/sessions/$sessionId/messages'),
-      headers: _headers,
-    );
+    final res = await _http
+        .get(
+          Uri.parse('$baseUrl/api/sessions/$sessionId/messages'),
+          headers: _headers,
+        )
+        .timeout(requestTimeout);
     if (res.statusCode != 200) {
       throw Exception('HTTP ${res.statusCode}: ${res.body}');
     }
@@ -687,10 +716,12 @@ class ApiClient {
 
   Future<void> deleteSession(String sessionId) async {
     final encodedId = Uri.encodeComponent(sessionId);
-    final res = await _http.delete(
-      Uri.parse('$baseUrl/api/sessions/$encodedId'),
-      headers: _headers,
-    );
+    final res = await _http
+        .delete(
+          Uri.parse('$baseUrl/api/sessions/$encodedId'),
+          headers: _headers,
+        )
+        .timeout(requestTimeout);
     // Treat a stale local row as already synced: the remote no longer has it,
     // so the UI can safely remove it from history.
     if (res.statusCode == 404) return;
@@ -702,10 +733,9 @@ class ApiClient {
   // ── Models ───────────────────────────────────────────────────────────
 
   Future<List<String>> getModels() async {
-    final res = await _http.get(
-      Uri.parse('$baseUrl/v1/models'),
-      headers: _headers,
-    );
+    final res = await _http
+        .get(Uri.parse('$baseUrl/v1/models'), headers: _headers)
+        .timeout(requestTimeout);
     if (res.statusCode != 200) {
       return ['hermes-agent'];
     }
@@ -758,19 +788,17 @@ class ApiClient {
   // ── Generic HTTP helpers (for Dashboard API compatibility) ────────────
 
   Future<Map<String, dynamic>> apiGet(String endpoint) async {
-    final res = await _http.get(
-      Uri.parse('$baseUrl/$endpoint'),
-      headers: _headers,
-    );
+    final res = await _http
+        .get(Uri.parse('$baseUrl/$endpoint'), headers: _headers)
+        .timeout(requestTimeout);
     if (res.statusCode != 200) throw Exception('HTTP ${res.statusCode}');
     return jsonDecode(res.body) as Map<String, dynamic>;
   }
 
   Future<List<dynamic>> apiGetList(String endpoint) async {
-    final res = await _http.get(
-      Uri.parse('$baseUrl/$endpoint'),
-      headers: _headers,
-    );
+    final res = await _http
+        .get(Uri.parse('$baseUrl/$endpoint'), headers: _headers)
+        .timeout(requestTimeout);
     if (res.statusCode != 200) throw Exception('HTTP ${res.statusCode}');
     return jsonDecode(res.body) as List<dynamic>;
   }
@@ -779,11 +807,13 @@ class ApiClient {
     String endpoint, {
     Map<String, dynamic>? body,
   }) async {
-    final res = await _http.post(
-      Uri.parse('$baseUrl/$endpoint'),
-      headers: _headers,
-      body: body != null ? jsonEncode(body) : null,
-    );
+    final res = await _http
+        .post(
+          Uri.parse('$baseUrl/$endpoint'),
+          headers: _headers,
+          body: body != null ? jsonEncode(body) : null,
+        )
+        .timeout(requestTimeout);
     if (res.statusCode < 200 || res.statusCode >= 300) {
       throw Exception('HTTP ${res.statusCode}');
     }
@@ -791,10 +821,9 @@ class ApiClient {
   }
 
   Future<void> apiDelete(String endpoint) async {
-    final res = await _http.delete(
-      Uri.parse('$baseUrl/$endpoint'),
-      headers: _headers,
-    );
+    final res = await _http
+        .delete(Uri.parse('$baseUrl/$endpoint'), headers: _headers)
+        .timeout(requestTimeout);
     if (res.statusCode < 200 || res.statusCode >= 300) {
       throw Exception('HTTP ${res.statusCode}');
     }
@@ -827,9 +856,15 @@ typedef ToolProgressCallback = void Function(Map<String, dynamic> progress);
 class GatewayChatClient {
   final ApiClient _api;
   final String _baseUrl;
-  StreamSubscription<String>? _activeStreamSubscription;
-  Completer<void>? _activeStreamCompletion;
-  bool _activeStreamCancelled = false;
+
+  /// Per-call stream state: each sendMessageStreaming call owns a
+  /// _LiveStream, and the client keeps only the current one, which
+  /// cancelActiveMessage targets. (Previously three shared fields let a
+  /// second send overwrite the first's slot and let cancel-then-resend
+  /// reset the cancelled flag before the cancelled stream's onDone
+  /// check ran — so a cancelled turn reported success and the orphaned
+  /// subscription kept pushing tokens into stale callbacks.)
+  _LiveStream? _liveStream;
 
   GatewayChatClient(this._api) : _baseUrl = _api.baseUrl;
 
@@ -954,22 +989,54 @@ class GatewayChatClient {
     };
 
     final headers = {..._api._headers, 'X-Hermes-Session-Id': sessionId};
-    final completion = Completer<void>();
-    _activeStreamCompletion = completion;
-    _activeStreamCancelled = false;
+    final stream = _LiveStream();
+    final previous = _liveStream;
+    // A second concurrent send supersedes the first: cancel the old one
+    // with its OWN state so its callbacks are muted rather than silently
+    // drained into the new call's flags.
+    if (previous != null) {
+      previous.cancelled = true;
+      if (!previous.cancellation.isCompleted) {
+        previous.cancellation.complete();
+      }
+      final sub = previous.subscription;
+      if (sub != null) {
+        unawaited(sub.cancel());
+      }
+      if (!previous.completion.isCompleted) previous.completion.complete();
+    }
+    _liveStream = stream;
+    final completion = stream.completion;
 
     try {
-      final request = http.Request(
+      final request = http.AbortableRequest(
         'POST',
         Uri.parse('$_baseUrl/v1/chat/completions'),
+        abortTrigger: stream.cancellation.future,
       );
       request.headers.addAll(headers);
       request.body = jsonEncode(body);
 
-      final response = await _api._http.send(request);
+      final responseFuture = _api._http.send(request);
+      final response = await Future.any<http.StreamedResponse?>([
+        responseFuture.then<http.StreamedResponse?>((value) => value),
+        stream.cancellation.future.then<http.StreamedResponse?>((_) => null),
+      ]);
+      if (response == null) {
+        // AbortableRequest is honoured by package:http's production clients.
+        // The race above is also a safe fallback for an injected/custom client
+        // that ignores it: settle this send now, then discard any late body
+        // without invoking user callbacks or closing the shared ApiClient.
+        unawaited(
+          responseFuture.then<void>((lateResponse) {
+            final subscription = lateResponse.stream.listen((_) {});
+            unawaited(subscription.cancel());
+          }, onError: (Object _, StackTrace _) {}),
+        );
+        return;
+      }
 
-      if (_activeStreamCancelled ||
-          !identical(_activeStreamCompletion, completion)) {
+      if (stream.cancelled || !identical(_liveStream, stream)) {
         final subscription = response.stream.listen((_) {});
         await subscription.cancel();
         return;
@@ -992,22 +1059,29 @@ class GatewayChatClient {
       }
 
       String buffer = '';
-      _activeStreamSubscription = response.stream
+      stream.subscription = response.stream
           .transform(utf8.decoder)
           .listen(
             (chunk) {
-              if (_activeStreamCancelled) return;
+              // A superseded or cancelled stream must never deliver tokens
+              // into these callbacks: the UI has moved on (or already
+              // reported the cancellation).
+              if (stream.cancelled || !identical(_liveStream, stream)) return;
               buffer += chunk;
-              while (buffer.contains('\n\n')) {
-                final eventEnd = buffer.indexOf('\n\n');
-                final frame = buffer.substring(0, eventEnd);
-                buffer = buffer.substring(eventEnd + 2);
+              // SSE frames end on a blank line: LF-only or CRLF-only per
+              // the spec. A CRLF-emitting proxy would otherwise never
+              // match and the stream would look frozen until the end.
+              var boundary = RegExp(r'\r?\n\r?\n').firstMatch(buffer);
+              while (boundary != null) {
+                final frame = buffer.substring(0, boundary.start);
+                buffer = buffer.substring(boundary.end);
 
                 final token = parseSseFrame(
                   frame,
                   onToolProgress: onToolProgress,
                 );
                 if (token != null && token.isNotEmpty) onToken(token);
+                boundary = RegExp(r'\r?\n\r?\n').firstMatch(buffer);
               }
             },
             onError: (Object error, StackTrace stackTrace) {
@@ -1022,14 +1096,14 @@ class GatewayChatClient {
           );
       await completion.future;
 
-      if (!_activeStreamCancelled) onDone();
+      // Per-call flag: a newer send cannot reset this call's cancelled
+      // state, so a cancelled turn never reports onDone.
+      if (!stream.cancelled) onDone();
     } catch (e) {
-      if (!_activeStreamCancelled) onError(e.toString());
+      if (!stream.cancelled) onError(e.toString());
     } finally {
-      if (identical(_activeStreamCompletion, completion)) {
-        _activeStreamSubscription = null;
-        _activeStreamCompletion = null;
-        _activeStreamCancelled = false;
+      if (identical(_liveStream, stream)) {
+        _liveStream = null;
       }
     }
   }
@@ -1037,21 +1111,57 @@ class GatewayChatClient {
   /// Cancels the current SSE response. The Hermes API server treats the
   /// resulting client disconnect as an agent interrupt.
   Future<bool> cancelActiveMessage() async {
-    final completion = _activeStreamCompletion;
-    if (completion == null) return false;
+    final stream = _liveStream;
+    if (stream == null) return false;
 
-    _activeStreamCancelled = true;
-    final subscription = _activeStreamSubscription;
+    stream.cancelled = true;
+    if (!stream.cancellation.isCompleted) stream.cancellation.complete();
+    final subscription = stream.subscription;
     if (subscription != null) {
       await subscription.cancel();
     }
-    if (!completion.isCompleted) completion.complete();
+    if (!stream.completion.isCompleted) stream.completion.complete();
     return true;
   }
 
   void abort() {
-    _api.close();
+    final stream = _liveStream;
+    if (stream != null) {
+      stream.cancelled = true;
+      if (!stream.cancellation.isCompleted) stream.cancellation.complete();
+      final sub = stream.subscription;
+      if (sub != null) {
+        unawaited(sub.cancel());
+      }
+      if (!stream.completion.isCompleted) stream.completion.complete();
+      _liveStream = null;
+    }
+    // NOTE: deliberately does NOT close the shared ApiClient's HTTP
+    // client — the same ApiClient instance feeds the session list and
+    // health checks, and closing it killed every later HTTP call on it.
   }
+}
+
+/// Per-call SSE stream state owned by one sendMessageStreaming call.
+class _LiveStream {
+  final Completer<void> completion = Completer<void>();
+  final Completer<void> cancellation = Completer<void>();
+  StreamSubscription<String>? subscription;
+  bool cancelled = false;
+}
+
+/// A non-200 answer from a dashboard API call, carrying the status code so
+/// callers can distinguish authoritative outcomes (404 = the resource is
+/// definitively absent) from unknowable ones (403/5xx/timeout = existence
+/// cannot be determined). Callers that must never act on a guess — like
+/// the project folder provisioner — branch on this instead of string-
+/// matching a bare Exception.
+class DashboardHttpException implements Exception {
+  final int statusCode;
+  const DashboardHttpException(this.statusCode);
+
+  @override
+  String toString() => 'HTTP $statusCode';
 }
 
 /// Client for the Hermes Dashboard REST API.
@@ -1077,8 +1187,10 @@ class DashboardClient {
   final bool _proxied;
   final String? _username;
   final String? _password;
+  final String? _gatewayProfile;
   String? _token;
   String? _cookie;
+  int _authGeneration = 0;
   // In-flight auth requests, shared so concurrent /api calls trigger a single
   // login / token fetch instead of a thundering herd (the dashboard
   // rate-limits password logins).
@@ -1098,18 +1210,26 @@ class DashboardClient {
     bool proxied = false,
     String? username,
     String? password,
+    String? gatewayProfile,
     http.Client? httpClient,
   }) : _proxied = proxied,
        _username = username,
        _password = password,
+       _gatewayProfile = gatewayProfile?.trim().isEmpty == true
+           ? null
+           : gatewayProfile?.trim(),
        _baseUrl = SavedConnection.joinBaseUrl(
          '${useHttps ? 'https' : 'http'}://$host:$port',
          pathPrefix,
        ),
        _http = httpClient ?? http.Client();
 
-  /// Clears any cached auth state so the next request re-authenticates.
-  void _resetAuth() {
+  /// Clears cached auth only when the failed request used the current auth
+  /// generation. Concurrent stale 401s therefore cannot invalidate a newer
+  /// replacement login started by the first failure.
+  void _resetAuth({int? ifGeneration}) {
+    if (ifGeneration != null && ifGeneration != _authGeneration) return;
+    _authGeneration++;
     _token = null;
     _cookie = null;
     _cookieInFlight = null;
@@ -1120,69 +1240,95 @@ class DashboardClient {
   Future<String> _getCookie() {
     final cached = _cookie;
     if (cached != null) return Future.value(cached);
-    return _cookieInFlight ??= _login();
+    final inFlight = _cookieInFlight;
+    if (inFlight != null) return inFlight;
+    final generation = _authGeneration;
+    final future = _login();
+    _cookieInFlight = future;
+    // Cache only if this login still belongs to the active generation. A stale
+    // login completing after a 401 reset must not overwrite its replacement.
+    future
+        .then((cookie) {
+          if (_authGeneration == generation &&
+              identical(_cookieInFlight, future)) {
+            _cookie = cookie;
+          }
+        })
+        .whenComplete(() {
+          if (identical(_cookieInFlight, future)) _cookieInFlight = null;
+        })
+        .ignore();
+    return future;
   }
 
   /// Logs in against the `basic` password provider and caches the session
   /// cookie. Throws on failure (bad credentials → 401, etc.).
   Future<String> _login() async {
-    try {
-      final res = await _http.post(
-        Uri.parse('$_baseUrl/auth/password-login'),
-        headers: const {'Content-Type': 'application/json'},
-        body: jsonEncode({
-          'provider': 'basic',
-          'username': _username,
-          'password': _password,
-        }),
-      );
-      if (res.statusCode == 401) {
-        throw Exception('Dashboard login failed: invalid username or password');
-      }
-      if (res.statusCode != 200) {
-        throw Exception('Dashboard login failed: HTTP ${res.statusCode}');
-      }
-      final setCookie = res.headers['set-cookie'] ?? '';
-      // The `http` package folds multiple Set-Cookie headers into one
-      // comma-joined string; cookie expiry dates also contain commas, so match
-      // the access-token cookie by name and take its value up to the first
-      // delimiter. Handles the bare name plus the __Host-/__Secure- prefixes
-      // Hermes uses on HTTPS binds.
-      final match = RegExp(
-        r'((?:__Host-|__Secure-)?hermes_session_at)=([^;,\s]+)',
-      ).firstMatch(setCookie);
-      if (match == null) {
-        throw Exception(
-          'Dashboard login succeeded but no session cookie found',
-        );
-      }
-      _cookie = '${match.group(1)}=${match.group(2)}';
-      return _cookie!;
-    } finally {
-      _cookieInFlight = null;
+    final res = await _http
+        .post(
+          Uri.parse('$_baseUrl/auth/password-login'),
+          headers: const {'Content-Type': 'application/json'},
+          body: jsonEncode({
+            'provider': 'basic',
+            'username': _username,
+            'password': _password,
+          }),
+        )
+        .timeout(ApiClient.requestTimeout);
+    if (res.statusCode == 401) {
+      throw Exception('Dashboard login failed: invalid username or password');
     }
+    if (res.statusCode != 200) {
+      throw Exception('Dashboard login failed: HTTP ${res.statusCode}');
+    }
+    final setCookie = res.headers['set-cookie'] ?? '';
+    // The `http` package folds multiple Set-Cookie headers into one
+    // comma-joined string; cookie expiry dates also contain commas, so match
+    // the access-token cookie by name and take its value up to the first
+    // delimiter. Handles the bare name plus the __Host-/__Secure- prefixes
+    // Hermes uses on HTTPS binds.
+    final match = RegExp(
+      r'((?:__Host-|__Secure-)?hermes_session_at)=([^;,\s]+)',
+    ).firstMatch(setCookie);
+    if (match == null) {
+      throw Exception('Dashboard login succeeded but no session cookie found');
+    }
+    return '${match.group(1)}=${match.group(2)}';
   }
 
   /// Returns the SPA session token, reusing a cached value or an in-flight fetch.
   Future<String> _getToken() {
     final cached = _token;
     if (cached != null) return Future.value(cached);
-    return _tokenInFlight ??= _fetchToken();
+    final inFlight = _tokenInFlight;
+    if (inFlight != null) return inFlight;
+    final generation = _authGeneration;
+    final future = _fetchToken();
+    _tokenInFlight = future;
+    future
+        .then((token) {
+          if (_authGeneration == generation &&
+              identical(_tokenInFlight, future)) {
+            _token = token;
+          }
+        })
+        .whenComplete(() {
+          if (identical(_tokenInFlight, future)) _tokenInFlight = null;
+        })
+        .ignore();
+    return future;
   }
 
   Future<String> _fetchToken() async {
-    try {
-      final res = await _http.get(Uri.parse('$_baseUrl/'));
-      if (res.statusCode != 200) throw Exception('Dashboard not reachable');
-      final match = RegExp(
-        r'window\.__HERMES_SESSION_TOKEN__="([^"]+)";',
-      ).firstMatch(res.body);
-      if (match == null) throw Exception('Session token not found');
-      _token = match.group(1)!;
-      return _token!;
-    } finally {
-      _tokenInFlight = null;
-    }
+    final res = await _http
+        .get(Uri.parse('$_baseUrl/'))
+        .timeout(ApiClient.requestTimeout);
+    if (res.statusCode != 200) throw Exception('Dashboard not reachable');
+    final match = RegExp(
+      r'window\.__HERMES_SESSION_TOKEN__="([^"]+)";',
+    ).firstMatch(res.body);
+    if (match == null) throw Exception('Session token not found');
+    return match.group(1)!;
   }
 
   Future<Map<String, String>> _authHeaders() async {
@@ -1208,12 +1354,13 @@ class DashboardClient {
   /// Hermes Desktop gateway. The HTTP API cookie stays in this client; only the
   /// ticket is passed to the WebSocket URL.
   Future<String> mintWebSocketTicket({bool retried = false}) async {
-    final res = await _http.post(
-      Uri.parse('$_baseUrl/api/auth/ws-ticket'),
-      headers: await _authHeaders(),
-    );
+    final authGeneration = _authGeneration;
+    final headers = await _authHeaders();
+    final res = await _http
+        .post(Uri.parse('$_baseUrl/api/auth/ws-ticket'), headers: headers)
+        .timeout(ApiClient.requestTimeout);
     if (res.statusCode == 401 && !retried) {
-      _resetAuth();
+      _resetAuth(ifGeneration: authGeneration);
       return mintWebSocketTicket(retried: true);
     }
     if (res.statusCode != 200) {
@@ -1242,16 +1389,19 @@ class DashboardClient {
     Map<String, String>? queryParameters,
     bool retried = false,
   }) async {
+    final authGeneration = _authGeneration;
     final headers = await _authHeaders();
     final uri = Uri.parse(
       '$_baseUrl/api/$endpoint',
     ).replace(queryParameters: queryParameters);
-    final res = await _http.get(uri, headers: headers);
+    final res = await _http
+        .get(uri, headers: headers)
+        .timeout(ApiClient.requestTimeout);
     if (res.statusCode == 401 && !retried) {
-      _resetAuth();
+      _resetAuth(ifGeneration: authGeneration);
       return apiGet(endpoint, queryParameters: queryParameters, retried: true);
     }
-    if (res.statusCode != 200) throw Exception('HTTP ${res.statusCode}');
+    if (res.statusCode != 200) throw DashboardHttpException(res.statusCode);
     return _decodeMapResponse(res);
   }
 
@@ -1260,13 +1410,16 @@ class DashboardClient {
     Map<String, String>? queryParameters,
     bool retried = false,
   }) async {
+    final authGeneration = _authGeneration;
     final headers = await _authHeaders();
     final uri = Uri.parse(
       '$_baseUrl/api/$endpoint',
     ).replace(queryParameters: queryParameters);
-    final res = await _http.get(uri, headers: headers);
+    final res = await _http
+        .get(uri, headers: headers)
+        .timeout(ApiClient.requestTimeout);
     if (res.statusCode == 401 && !retried) {
-      _resetAuth();
+      _resetAuth(ifGeneration: authGeneration);
       return apiGetBytes(
         endpoint,
         queryParameters: queryParameters,
@@ -1279,16 +1432,24 @@ class DashboardClient {
 
   Future<List<dynamic>> apiGetList(
     String endpoint, {
+    Map<String, String>? queryParameters,
     bool retried = false,
   }) async {
+    final authGeneration = _authGeneration;
     final headers = await _authHeaders();
-    final res = await _http.get(
-      Uri.parse('$_baseUrl/api/$endpoint'),
-      headers: headers,
-    );
+    final uri = Uri.parse(
+      '$_baseUrl/api/$endpoint',
+    ).replace(queryParameters: queryParameters);
+    final res = await _http
+        .get(uri, headers: headers)
+        .timeout(ApiClient.requestTimeout);
     if (res.statusCode == 401 && !retried) {
-      _resetAuth();
-      return apiGetList(endpoint, retried: true);
+      _resetAuth(ifGeneration: authGeneration);
+      return apiGetList(
+        endpoint,
+        queryParameters: queryParameters,
+        retried: true,
+      );
     }
     if (res.statusCode != 200) throw Exception('HTTP ${res.statusCode}');
     final decoded = jsonDecode(res.body);
@@ -1299,20 +1460,173 @@ class DashboardClient {
     throw Exception('Expected list response');
   }
 
+  /// Lists server-archived sessions from the dashboard's session router.
+  ///
+  /// The gateway api_server that serves the chat transport ignores the
+  /// `archived` query param entirely (live-verified: its list never
+  /// contains archived rows), so the Chats browser's Archived chip reads
+  /// them from the dashboard instead — the same `archived=only` router the
+  /// dashboard's own Archived view uses, and the only stock Hermes surface
+  /// that enumerates archived sessions. Requires dashboard credentials on
+  /// the connection; callers degrade honestly when this throws.
+  ///
+  /// Pages to completion: the router caps each page at 100 rows and
+  /// reports the full match count in `total`, so a single request would
+  /// silently truncate anyone with more than one page of archived chats.
+  /// [gatewayProfile] scopes the read to the connection's Hermes profile
+  /// (the router opens that profile's session DB); omitting it would list
+  /// the dashboard process's own default profile instead — the wrong
+  /// store on a multiplexed gateway.
+  ///
+  /// Termination is by offset/no-progress, never by comparing the
+  /// accumulated row count against `total`: the same pinned back-fill
+  /// semantics as the live list can repeat rows across pages, and an
+  /// inflated `all.length >= total` would stop before every offset
+  /// window has been read, truncating the archive. Rows are deduplicated
+  /// by session id so repeats never surface twice. [maxPages] is the
+  /// explicit safety cap: if it is reached while the list was not
+  /// exhausted the read throws rather than silently returning a partial
+  /// archive — callers degrade honestly on the error instead of showing
+  /// a truncated list as complete.
+  Future<List<Session>> getArchivedSessions({
+    int pageSize = 100,
+    int maxPages = 20,
+    String? gatewayProfile,
+  }) async {
+    final all = <Session>[];
+    final seenIds = <String>{};
+    var offset = 0;
+    var exhausted = false;
+    int? total;
+    // Fallback pin-bound bookkeeping for a router that omits `total`
+    // (see the loop comment): max pins on any page bounds the pin set, and
+    // k consecutive zero-new windows consume k*pageSize disjoint pins.
+    var pinBound = 0;
+    var zeroNewPages = 0;
+    for (var page = 0; page < maxPages; page++) {
+      final data = await apiGet(
+        'sessions',
+        queryParameters: {
+          'archived': 'only',
+          'order': 'recent',
+          'limit': '$pageSize',
+          'offset': '$offset',
+          if (gatewayProfile != null && gatewayProfile.isNotEmpty)
+            'profile': gatewayProfile,
+        },
+      );
+      // The dashboard router reports the filtered row count alongside the
+      // page (`total = session_count(same scope)`), so the LIMIT/OFFSET
+      // windows together cover exactly `total` rows — pins inside the
+      // window are part of that count, back-filled pins are repeats of
+      // rows already counted. Advancing until the offset covers `total`
+      // cannot confuse a pin-only window (zero new ids, rows still ahead)
+      // with the end of the archive.
+      final reportedTotal = data['total'];
+      if (reportedTotal is int && reportedTotal >= 0) total = reportedTotal;
+      final list = data['sessions'] as List? ?? [];
+      final rows = list
+          .whereType<Map<String, dynamic>>()
+          .map((s) => Session.fromJson(s))
+          .toList();
+      var newRows = 0;
+      for (final row in rows) {
+        if (seenIds.add(row.id)) {
+          all.add(row);
+          newRows++;
+        }
+      }
+      offset += pageSize;
+      if (total != null) {
+        if (offset >= total) {
+          exhausted = true;
+          break;
+        }
+        continue;
+      }
+      // No `total` (non-standard router): fall back to the client-side
+      // proof — a single zero-new page is NOT exhaustion when pins exist
+      // (a later all-pin window repeats seen ids while unseen rows
+      // remain); k consecutive zero-new windows past the pin bound are.
+      final pinsOnPage = rows.where((row) => row.pinned).length;
+      if (pinsOnPage > pinBound) pinBound = pinsOnPage;
+      if (rows.isEmpty || newRows == 0) {
+        zeroNewPages++;
+        final required = pinBound == 0 ? 1 : pinBound ~/ pageSize + 1;
+        if (zeroNewPages >= required) {
+          exhausted = true;
+          break;
+        }
+      } else {
+        zeroNewPages = 0;
+      }
+    }
+    if (!exhausted) {
+      throw StateError(
+        'Archived session list exceeded the $maxPages-page cap without '
+        'reaching its end; refusing to present a possibly truncated '
+        'archive as complete.',
+      );
+    }
+    return all;
+  }
+
+  Map<String, String>? _cronQuery([Map<String, String>? parameters]) {
+    final profile = _gatewayProfile;
+    if (profile == null) return parameters;
+    return {...?parameters, 'profile': profile};
+  }
+
+  Future<List<Map<String, dynamic>>> getCronJobs() async {
+    final data = await apiGetList('cron/jobs', queryParameters: _cronQuery());
+    return data.whereType<Map<String, dynamic>>().toList();
+  }
+
+  /// Run sessions produced by one cron job, newest first.
+  ///
+  /// Mirrors the desktop's `getCronJobRuns` (apps/desktop/src/api/cron.ts):
+  /// runs are ordinary sessions with id `cron_{job_id}_{timestamp}` and
+  /// `source='cron'`, enumerated by the dashboard's bounded id-range scan.
+  /// This is the desktop-parity home for cron output: the chat list excludes
+  /// machine-source rows, so per-job runs are browsed here instead.
+  Future<List<Session>> getCronJobRuns(String jobId, {int limit = 20}) async {
+    final data = await apiGet(
+      'cron/jobs/${Uri.encodeComponent(jobId)}/runs',
+      queryParameters: _cronQuery({'limit': '$limit'}),
+    );
+    final list = data['runs'] as List? ?? [];
+    return list
+        .whereType<Map<String, dynamic>>()
+        .map((s) => Session.fromJson(s))
+        .toList();
+  }
+
   Future<Map<String, dynamic>> apiPost(
     String endpoint, {
     Map<String, dynamic>? body,
+    Map<String, String>? queryParameters,
     bool retried = false,
   }) async {
+    final authGeneration = _authGeneration;
     final headers = await _authHeaders();
-    final res = await _http.post(
-      Uri.parse('$_baseUrl/api/$endpoint'),
-      headers: headers,
-      body: body != null ? jsonEncode(body) : null,
-    );
+    final uri = Uri.parse(
+      '$_baseUrl/api/$endpoint',
+    ).replace(queryParameters: queryParameters);
+    final res = await _http
+        .post(
+          uri,
+          headers: headers,
+          body: body != null ? jsonEncode(body) : null,
+        )
+        .timeout(ApiClient.requestTimeout);
     if (res.statusCode == 401 && !retried) {
-      _resetAuth();
-      return apiPost(endpoint, body: body, retried: true);
+      _resetAuth(ifGeneration: authGeneration);
+      return apiPost(
+        endpoint,
+        body: body,
+        queryParameters: queryParameters,
+        retried: true,
+      );
     }
     if (res.statusCode < 200 || res.statusCode >= 300) {
       throw Exception('HTTP ${res.statusCode}');
@@ -1320,15 +1634,26 @@ class DashboardClient {
     return _decodeMapResponse(res);
   }
 
-  Future<void> apiDelete(String endpoint, {bool retried = false}) async {
+  Future<void> apiDelete(
+    String endpoint, {
+    Map<String, String>? queryParameters,
+    bool retried = false,
+  }) async {
+    final authGeneration = _authGeneration;
     final headers = await _authHeaders();
-    final res = await _http.delete(
-      Uri.parse('$_baseUrl/api/$endpoint'),
-      headers: headers,
-    );
+    final uri = Uri.parse(
+      '$_baseUrl/api/$endpoint',
+    ).replace(queryParameters: queryParameters);
+    final res = await _http
+        .delete(uri, headers: headers)
+        .timeout(ApiClient.requestTimeout);
     if (res.statusCode == 401 && !retried) {
-      _resetAuth();
-      return apiDelete(endpoint, retried: true);
+      _resetAuth(ifGeneration: authGeneration);
+      return apiDelete(
+        endpoint,
+        queryParameters: queryParameters,
+        retried: true,
+      );
     }
     if (res.statusCode < 200 || res.statusCode >= 300) {
       throw Exception('HTTP ${res.statusCode}');
@@ -1338,17 +1663,31 @@ class DashboardClient {
   Future<Map<String, dynamic>> apiPut(
     String endpoint, {
     Map<String, dynamic>? body,
+    Map<String, String>? queryParameters,
     bool retried = false,
+    Duration timeout = ApiClient.requestTimeout,
   }) async {
+    final authGeneration = _authGeneration;
     final headers = await _authHeaders();
-    final res = await _http.put(
-      Uri.parse('$_baseUrl/api/$endpoint'),
-      headers: headers,
-      body: body != null ? jsonEncode(body) : null,
-    );
+    final uri = Uri.parse(
+      '$_baseUrl/api/$endpoint',
+    ).replace(queryParameters: queryParameters);
+    final res = await _http
+        .put(
+          uri,
+          headers: headers,
+          body: body != null ? jsonEncode(body) : null,
+        )
+        .timeout(timeout);
     if (res.statusCode == 401 && !retried) {
-      _resetAuth();
-      return apiPut(endpoint, body: body, retried: true);
+      _resetAuth(ifGeneration: authGeneration);
+      return apiPut(
+        endpoint,
+        body: body,
+        queryParameters: queryParameters,
+        retried: true,
+        timeout: timeout,
+      );
     }
     if (res.statusCode < 200 || res.statusCode >= 300) {
       throw Exception('HTTP ${res.statusCode}');
@@ -1381,6 +1720,7 @@ class DashboardClient {
     String deliver = 'local',
   }) => apiPost(
     'cron/jobs',
+    queryParameters: _cronQuery(),
     body: {
       'prompt': prompt,
       'schedule': schedule,
@@ -1396,23 +1736,31 @@ class DashboardClient {
   Future<Map<String, dynamic>> updateJob(
     String jobId,
     Map<String, dynamic> updates, {
-    bool retried = false,
-  }) async {
-    final headers = await _authHeaders();
-    final res = await _http.put(
-      Uri.parse('$_baseUrl/api/cron/jobs/$jobId'),
-      headers: headers,
-      body: jsonEncode(buildCronUpdateBody(updates)),
-    );
-    if (res.statusCode == 401 && !retried) {
-      _resetAuth();
-      return updateJob(jobId, updates, retried: true);
-    }
-    if (res.statusCode < 200 || res.statusCode >= 300) {
-      throw Exception('HTTP ${res.statusCode}');
-    }
-    return jsonDecode(res.body) as Map<String, dynamic>;
-  }
+    Duration timeout = ApiClient.requestTimeout,
+  }) => apiPut(
+    'cron/jobs/${Uri.encodeComponent(jobId)}',
+    queryParameters: _cronQuery(),
+    body: buildCronUpdateBody(updates),
+    timeout: timeout,
+  );
+
+  Future<Map<String, dynamic>> setJobPaused(
+    String jobId, {
+    required bool paused,
+  }) => apiPost(
+    'cron/jobs/${Uri.encodeComponent(jobId)}/${paused ? 'pause' : 'resume'}',
+    queryParameters: _cronQuery(),
+  );
+
+  Future<Map<String, dynamic>> triggerJob(String jobId) => apiPost(
+    'cron/jobs/${Uri.encodeComponent(jobId)}/trigger',
+    queryParameters: _cronQuery(),
+  );
+
+  Future<void> deleteJob(String jobId) => apiDelete(
+    'cron/jobs/${Uri.encodeComponent(jobId)}',
+    queryParameters: _cronQuery(),
+  );
 
   void close() => _http.close();
 }

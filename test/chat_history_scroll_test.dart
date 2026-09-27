@@ -582,7 +582,9 @@ class _ControlledRemotePrompt {
     required String sessionId,
     required String text,
     required StreamCallback onEvent,
+    required void Function() onSent,
   }) async {
+    onSent();
     _onEvent = onEvent;
     _completion = Completer<void>();
     if (!started.isCompleted) started.complete();

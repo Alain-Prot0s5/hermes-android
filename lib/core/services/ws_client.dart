@@ -6,6 +6,7 @@
 // a JSON-RPC response with the same id.
 import 'dart:async';
 import 'dart:convert';
+
 import 'package:web_socket_channel/io.dart';
 
 Object? _deepFreezeJson(Object? value) {
@@ -158,6 +159,25 @@ class CreatedGatewaySession {
   });
 }
 
+/// Runtime binding and recovery state returned by `session.resume`.
+///
+/// Stock Hermes includes retained in-flight failure details here so a client
+/// that missed the terminal event while disconnected can stop recovery and
+/// surface the failure instead of polling history forever.
+class ResumedGatewaySession {
+  final String runtimeSessionId;
+  final bool? running;
+  final String? status;
+  final Map<String, dynamic>? inflight;
+
+  const ResumedGatewaySession({
+    required this.runtimeSessionId,
+    this.running,
+    this.status,
+    this.inflight,
+  });
+}
+
 typedef StreamCallback = void Function(StreamEvent event);
 typedef ConnectionCallback = void Function(bool connected);
 typedef GatewayReadyCallback = void Function(Map<String, dynamic> frame);
@@ -200,11 +220,39 @@ class WsClient {
     String? token,
     String? ticket,
     String? profile,
+    Duration heartbeatInterval = defaultHeartbeatInterval,
+    Duration heartbeatDeadline = defaultHeartbeatDeadline,
   }) {
-    return WsClient._(baseUrl, token, ticket, profile);
+    return WsClient._(
+      baseUrl,
+      token,
+      ticket,
+      profile,
+      heartbeatInterval,
+      heartbeatDeadline,
+    );
   }
 
-  WsClient._(this.baseUrl, this._token, this._ticket, this._profile);
+  WsClient._(
+    this.baseUrl,
+    this._token,
+    this._ticket,
+    this._profile,
+    this.heartbeatInterval,
+    this.heartbeatDeadline,
+  );
+
+  /// Keepalive cadence mirroring the desktop client
+  /// (`apps/shared/src/json-rpc-channel.ts` DEFAULT_HEARTBEAT_*): a
+  /// `gateway.ping` every 15s, dead-socket verdict after 45s of silence.
+  static const defaultHeartbeatInterval = Duration(seconds: 15);
+  static const defaultHeartbeatDeadline = Duration(seconds: 45);
+
+  final Duration heartbeatInterval;
+  final Duration heartbeatDeadline;
+  Timer? _heartbeatTimer;
+  int _heartbeatSeq = 0;
+  int _lastLivenessMs = 0;
 
   /// Connect to the WebSocket gateway.
   Future<void> connect() async {
@@ -241,6 +289,7 @@ class WsClient {
         );
       }
       _connected = true;
+      _startHeartbeat(generation);
       try {
         onConnectionChanged?.call(true);
       } catch (_) {
@@ -262,6 +311,7 @@ class WsClient {
     // Invalidate this socket before any completion or observer can enqueue
     // more work. Buffered callbacks from it now fail the generation guard.
     _connectionGeneration = generation + 1;
+    _stopHeartbeat();
     final wasConnected = _connected || _channel != null;
     _connected = false;
     _channel = null;
@@ -332,6 +382,53 @@ class WsClient {
     _connectionClosedListeners.remove(token);
   }
 
+  /// Keepalive loop mirroring the desktop `JsonRpcChannel.startHeartbeat`.
+  /// Every [heartbeatInterval] sends a `gateway.ping` (answered cheaply on
+  /// the gateway's WS reader thread, even while every agent is mid-turn);
+  /// if nothing has been received for [heartbeatDeadline] the socket is
+  /// declared half-open and torn down, which starts the owner's reconnect
+  /// instead of leaving later RPCs parked on a dead pipe.
+  void _startHeartbeat(int generation) {
+    _stopHeartbeat();
+    if (heartbeatInterval.inMilliseconds <= 0 ||
+        heartbeatDeadline.inMilliseconds <= 0) {
+      return;
+    }
+    _lastLivenessMs = DateTime.now().millisecondsSinceEpoch;
+    _heartbeatTimer = Timer.periodic(heartbeatInterval, (_) {
+      if (generation != _connectionGeneration || !_connected) return;
+      final silenceMs = DateTime.now().millisecondsSinceEpoch - _lastLivenessMs;
+      if (silenceMs >= heartbeatDeadline.inMilliseconds) {
+        // Half-open socket (phone slept, NAT dropped the mapping, proxy
+        // died): close it so the close path rejects pending calls and the
+        // owner can reconnect on a fresh ticket. 4000 = private close
+        // code (the channel rejects 1001).
+        _channel?.sink.close(4000, 'heartbeat timeout');
+        _handleClosedConnection(generation);
+        return;
+      }
+      _heartbeatSeq++;
+      try {
+        _channel?.sink.add(
+          jsonEncode({
+            'jsonrpc': '2.0',
+            'id': 'heartbeat-$_heartbeatSeq',
+            'method': 'gateway.ping',
+            'params': <String, dynamic>{},
+          }),
+        );
+      } catch (_) {
+        _channel?.sink.close(4000, 'heartbeat send failed');
+        _handleClosedConnection(generation);
+      }
+    });
+  }
+
+  void _stopHeartbeat() {
+    _heartbeatTimer?.cancel();
+    _heartbeatTimer = null;
+  }
+
   /// Produces the gateway `/api/ws` URL. Secured Desktop gateways use a
   /// single-use ticket; insecure legacy gateways still use a session token.
   static String buildWebSocketUrl(
@@ -373,6 +470,10 @@ class WsClient {
   /// Handle inbound messages.
   void _handleMessage(dynamic msg, int generation) {
     if (generation != _connectionGeneration) return;
+    // Any inbound frame proves the socket is alive ('any-inbound' liveness,
+    // matching the desktop channel): streaming events keep the heartbeat
+    // deadline reset even if the pong for one ping raced past it.
+    _lastLivenessMs = DateTime.now().millisecondsSinceEpoch;
     try {
       Map<String, dynamic> data;
       if (msg is String) {
@@ -576,6 +677,7 @@ class WsClient {
     String method,
     Map<String, dynamic> params, {
     Duration timeout = const Duration(seconds: 30),
+    void Function()? onSent,
   }) async {
     if (!_connected || _channel == null) {
       throw Exception('Not connected');
@@ -591,14 +693,26 @@ class WsClient {
     });
 
     _pending[id] = _Pending(method, completer, timer);
-    _channel!.sink.add(
-      jsonEncode({
-        'jsonrpc': '2.0',
-        'method': method,
-        'params': withProfile(params, _profile),
-        'id': id,
-      }),
-    );
+    try {
+      _channel!.sink.add(
+        jsonEncode({
+          'jsonrpc': '2.0',
+          'method': method,
+          'params': withProfile(params, _profile),
+          'id': id,
+        }),
+      );
+    } catch (_) {
+      timer.cancel();
+      _pending.remove(id);
+      rethrow;
+    }
+    try {
+      onSent?.call();
+    } catch (_) {
+      // A local observer must not turn a successfully emitted RPC into an
+      // apparent transport failure.
+    }
     return completer.future;
   }
 
@@ -646,6 +760,7 @@ class WsClient {
     String message, {
     required String sessionId,
     required StreamCallback onEvent,
+    void Function()? onSent,
     Duration timeout = const Duration(minutes: 10),
   }) async {
     final completion = Completer<void>();
@@ -700,7 +815,7 @@ class WsClient {
       final response = await send('prompt.submit', {
         'session_id': sessionId,
         'text': message,
-      });
+      }, onSent: onSent);
       final error = response['error'];
       if (error != null) {
         throw _gatewayResponseError(
@@ -839,8 +954,8 @@ class WsClient {
     }
   }
 
-  /// Resume an existing session.
-  Future<String> resumeSession(String sessionId) async {
+  /// Resume an existing session while preserving retained turn state.
+  Future<ResumedGatewaySession> resumeSessionDetails(String sessionId) async {
     final result = await send('session.resume', {'session_id': sessionId});
     if (result['error'] != null) {
       throw _gatewayResponseError(
@@ -849,7 +964,33 @@ class WsClient {
         fallbackMessage: 'Unknown error',
       );
     }
-    return result['result']?['session_id'] as String? ?? sessionId;
+    final rawPayload = result['result'];
+    if (rawPayload is! Map) {
+      throw StateError('session.resume succeeded without a result payload.');
+    }
+    final payload = Map<String, dynamic>.from(rawPayload);
+    final runtimeSessionId = payload['session_id'] as String?;
+    if (runtimeSessionId == null || runtimeSessionId.isEmpty) {
+      throw StateError(
+        'session.resume succeeded without a session_id — refusing to bind '
+        'the caller-supplied id, which may not be the runtime session the '
+        'gateway resumed.',
+      );
+    }
+    final rawInflight = payload['inflight'];
+    return ResumedGatewaySession(
+      runtimeSessionId: runtimeSessionId,
+      running: payload['running'] as bool?,
+      status: payload['status']?.toString(),
+      inflight: rawInflight is Map
+          ? Map<String, dynamic>.from(rawInflight)
+          : null,
+    );
+  }
+
+  /// Backward-compatible runtime-id-only resume helper.
+  Future<String> resumeSession(String sessionId) async {
+    return (await resumeSessionDetails(sessionId)).runtimeSessionId;
   }
 
   Future<void> setSessionTitle(String sessionId, String title) async {
@@ -912,13 +1053,18 @@ class WsClient {
 
   /// Uploads one file or image to a remote Desktop gateway and returns the
   /// canonical `@file:` reference that must be included in the following turn.
+  ///
+  /// The wire params are exactly the stock gateway's `FileAttachParams`
+  /// (`extra="forbid"`: session_id/profile/path/data_url/name). An earlier
+  /// revision also sent `source_channel`/`source_profile`; those exist only
+  /// in the repo's fixture gateway and stock Hermes rejects them with
+  /// "invalid params for file.attach: source_channel: Extra inputs are not
+  /// permitted", so they must never go on the wire.
   Future<RemoteFileAttachment> attachFile({
     required String sessionId,
     required String name,
     required String dataUrl,
     String path = '',
-    String? sourceChannel,
-    String? sourceProfile,
   }) async {
     final params = <String, dynamic>{
       'session_id': sessionId,
@@ -926,12 +1072,6 @@ class WsClient {
       'path': path,
       'data_url': dataUrl,
     };
-    if (sourceChannel?.isNotEmpty == true) {
-      params['source_channel'] = sourceChannel;
-    }
-    if (sourceProfile?.isNotEmpty == true) {
-      params['source_profile'] = sourceProfile;
-    }
     final response = await send('file.attach', params);
     final error = response['error'];
     if (error != null) {

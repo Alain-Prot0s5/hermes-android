@@ -5,9 +5,13 @@
 //      DELETE /api/cron/jobs/{id}
 //      POST /api/cron/jobs — create new job
 //      PUT /api/cron/jobs/{id} — update existing job
+import 'dart:async';
+
 import 'package:flutter/material.dart';
 
 import '../services/connection_manager.dart';
+import '../utils/relative_time.dart';
+import 'chat_screen.dart';
 
 class CronScreen extends StatefulWidget {
   final SavedConnection connection;
@@ -23,6 +27,15 @@ class _CronScreenState extends State<CronScreen> {
   bool _loading = true;
   String? _error;
 
+  /// Desktop-parity run drill-down: expanding a job loads its run sessions
+  /// (`GET /api/cron/jobs/{id}/runs`) and each run opens as a resumable
+  /// chat transcript. The chat list no longer shows cron rows, so this is
+  /// the home for cron output on mobile.
+  final Set<String> _expandedJobs = {};
+  final Map<String, List<Session>> _runsByJob = {};
+  final Set<String> _runsLoading = {};
+  final Map<String, String> _runsErrorByJob = {};
+
   @override
   void initState() {
     super.initState();
@@ -34,6 +47,7 @@ class _CronScreenState extends State<CronScreen> {
       useHttps: widget.connection.useHttps,
       username: widget.connection.dashboardUsername,
       password: widget.connection.dashboardPassword,
+      gatewayProfile: widget.connection.gatewayProfile,
     );
     _loadJobs();
   }
@@ -51,11 +65,7 @@ class _CronScreenState extends State<CronScreen> {
     });
 
     try {
-      final data = await _client.apiGetList('cron/jobs');
-      final items = <Map<String, dynamic>>[];
-      for (final item in data) {
-        if (item is Map<String, dynamic>) items.add(item);
-      }
+      final items = await _client.getCronJobs();
 
       if (!mounted) return;
       setState(() {
@@ -105,10 +115,9 @@ class _CronScreenState extends State<CronScreen> {
     final jobId = job['id'] as String? ?? '';
     if (jobId.isEmpty) return;
     final paused = _isPaused(job);
-    final action = paused ? 'resume' : 'pause';
 
     try {
-      await _client.apiPost('cron/jobs/$jobId/$action');
+      await _client.setJobPaused(jobId, paused: !paused);
       if (paused) {
         job.remove('paused_at');
         job['state'] = 'active';
@@ -159,7 +168,7 @@ class _CronScreenState extends State<CronScreen> {
     if (confirmed != true) return;
 
     try {
-      await _client.apiDelete('cron/jobs/$jobId');
+      await _client.deleteJob(jobId);
       if (mounted) {
         setState(() => _jobs.removeWhere((j) => j['id'] == jobId));
         ScaffoldMessenger.of(
@@ -182,7 +191,7 @@ class _CronScreenState extends State<CronScreen> {
     final jobId = job['id'] as String? ?? '';
     if (jobId.isEmpty) return;
     try {
-      await _client.apiPost('cron/jobs/$jobId/trigger');
+      await _client.triggerJob(jobId);
       if (mounted) {
         ScaffoldMessenger.of(
           context,
@@ -195,6 +204,134 @@ class _CronScreenState extends State<CronScreen> {
         );
       }
     }
+  }
+
+  void _toggleRuns(String jobId) {
+    if (jobId.isEmpty) return;
+    setState(() {
+      if (_expandedJobs.remove(jobId)) {
+        _runsErrorByJob.remove(jobId);
+      } else {
+        _expandedJobs.add(jobId);
+      }
+    });
+    if (_expandedJobs.contains(jobId)) unawaited(_loadRuns(jobId));
+  }
+
+  Future<void> _loadRuns(String jobId) async {
+    if (_runsLoading.contains(jobId)) return;
+    setState(() {
+      _runsLoading.add(jobId);
+      _runsErrorByJob.remove(jobId);
+    });
+    try {
+      final runs = await _client.getCronJobRuns(jobId);
+      if (!mounted) return;
+      setState(() {
+        _runsByJob[jobId] = runs;
+        _runsLoading.remove(jobId);
+      });
+    } catch (e) {
+      if (!mounted) return;
+      setState(() {
+        _runsLoading.remove(jobId);
+        _runsErrorByJob[jobId] = e.toString();
+      });
+    }
+  }
+
+  /// Opens one cron run's transcript. A run is an ordinary session row
+  /// (`cron_{job_id}_{timestamp}`), so the regular ChatScreen resume path
+  /// shows the full transcript — same as the desktop's run-pill click.
+  void _openRun(Session run) {
+    Navigator.of(context).push(
+      MaterialPageRoute<void>(
+        builder: (_) => ChatScreen(connection: widget.connection, session: run),
+      ),
+    );
+  }
+
+  Widget _buildRunsSection(String jobId) {
+    if (_runsLoading.contains(jobId)) {
+      return const Padding(
+        padding: EdgeInsets.symmetric(vertical: 12),
+        child: Center(
+          child: SizedBox.square(
+            dimension: 20,
+            child: CircularProgressIndicator(strokeWidth: 2),
+          ),
+        ),
+      );
+    }
+    final error = _runsErrorByJob[jobId];
+    if (error != null) {
+      return Padding(
+        padding: const EdgeInsets.symmetric(vertical: 8),
+        child: Row(
+          children: [
+            const Icon(Icons.error_outline, size: 16, color: Colors.orange),
+            const SizedBox(width: 8),
+            Expanded(
+              child: Text(
+                'Couldn’t load runs: $error',
+                style: const TextStyle(fontSize: 12, color: Colors.orange),
+              ),
+            ),
+            TextButton(
+              onPressed: () => unawaited(_loadRuns(jobId)),
+              child: const Text('Retry'),
+            ),
+          ],
+        ),
+      );
+    }
+    final runs = _runsByJob[jobId] ?? const <Session>[];
+    if (runs.isEmpty) {
+      return const Padding(
+        padding: EdgeInsets.symmetric(vertical: 8),
+        child: Text(
+          'No runs yet.',
+          style: TextStyle(fontSize: 12, color: Colors.grey),
+        ),
+      );
+    }
+    final now = DateTime.now();
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.stretch,
+      children: [
+        for (final run in runs)
+          ListTile(
+            dense: true,
+            contentPadding: const EdgeInsets.only(left: 24, right: 8),
+            leading: Icon(
+              run.isActive
+                  ? Icons.play_circle_outline
+                  : Icons.check_circle_outline,
+              size: 18,
+              color: run.isActive ? Colors.green : Colors.grey,
+            ),
+            title: Text(
+              run.title.isEmpty ? 'Cron run' : run.title,
+              maxLines: 1,
+              overflow: TextOverflow.ellipsis,
+              style: const TextStyle(fontSize: 13),
+            ),
+            subtitle: run.preview.isEmpty
+                ? null
+                : Text(
+                    run.preview,
+                    maxLines: 1,
+                    overflow: TextOverflow.ellipsis,
+                    style: const TextStyle(fontSize: 11, color: Colors.grey),
+                  ),
+            trailing: Text(
+              formatRelativeTime(now, run.lastActive),
+              style: const TextStyle(fontSize: 11, color: Colors.grey),
+            ),
+            onTap: () => _openRun(run),
+          ),
+      ],
+    );
   }
 
   Future<void> _showAddJobDialog() async {
@@ -451,11 +588,16 @@ class _CronScreenState extends State<CronScreen> {
           final lastRun = job['last_run_at'] as String?;
           final nextRun = job['next_run_at'] as String?;
           final isNoAgent = job['no_agent'] == true;
+          final jobId = job['id'] as String? ?? '';
+          final expanded = _expandedJobs.contains(jobId);
 
           return Card(
             margin: const EdgeInsets.only(bottom: 8),
             child: InkWell(
-              onTap: () => _showEditJobDialog(job),
+              // Tap expands the run drill-down (desktop parity: cron output
+              // lives under the job, not in the chat list). Editing stays
+              // available from the overflow menu.
+              onTap: () => _toggleRuns(jobId),
               borderRadius: BorderRadius.circular(4),
               child: Padding(
                 padding: const EdgeInsets.all(12),
@@ -477,6 +619,11 @@ class _CronScreenState extends State<CronScreen> {
                             maxLines: 1,
                             overflow: TextOverflow.ellipsis,
                           ),
+                        ),
+                        Icon(
+                          expanded ? Icons.expand_less : Icons.expand_more,
+                          size: 20,
+                          color: Colors.grey,
                         ),
                         if (isNoAgent)
                           Container(
@@ -603,6 +750,10 @@ class _CronScreenState extends State<CronScreen> {
                         'Next: $nextRun',
                         style: TextStyle(fontSize: 11, color: Colors.grey[600]),
                       ),
+                    if (expanded) ...[
+                      const Divider(height: 16),
+                      _buildRunsSection(jobId),
+                    ],
                   ],
                 ),
               ),

@@ -196,14 +196,6 @@ class ChatSpaceStore {
     await _save(ChatSpaceState(spaces: state.spaces, assignments: assignments));
   }
 
-  Future<void> pruneAssignments(Set<String> liveSessionIds) async {
-    final state = await load();
-    final assignments = Map<String, String>.from(state.assignments)
-      ..removeWhere((sessionId, _) => !liveSessionIds.contains(sessionId));
-    if (assignments.length == state.assignments.length) return;
-    await _save(ChatSpaceState(spaces: state.spaces, assignments: assignments));
-  }
-
   String _normalizeName(String value) {
     final normalized = value.trim();
     if (normalized.isEmpty ||

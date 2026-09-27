@@ -47,7 +47,8 @@ List<dynamic> buildChatDisplayItems({
   }
 
   for (final msg in messages) {
-    final role = (msg['role'] as String?) ?? 'assistant';
+    final rawRole = (msg['role'] as String?) ?? 'assistant';
+    final role = rawRole == 'agent' ? 'assistant' : rawRole;
     if (isToolResultMessage(msg)) {
       if (toolQueue.isNotEmpty) currentGroup.add(toolQueue.removeAt(0));
       continue;
@@ -73,6 +74,7 @@ List<dynamic> buildChatDisplayItems({
       if (role == 'user') lastUserPrompt = content;
       displayItems.add({
         ...msg,
+        'role': role,
         '_display_content': content,
         if (role == 'assistant' && lastUserPrompt != null)
           '_retry_prompt': lastUserPrompt,

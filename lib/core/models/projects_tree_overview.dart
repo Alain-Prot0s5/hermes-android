@@ -69,9 +69,18 @@ class ProjectOverviewNode {
 
   /// The few most recent chats, as ranked by the server.
   ///
-  /// The only place the overview carries real chats, so a card that shows
-  /// recent activity depends entirely on this list.
+  /// The only place the overview carries real Session rows, so a card that
+  /// shows recent activity depends entirely on this list.
   final List<Session> previewSessions;
+
+  /// Every chat id this project claims — not just the preview window.
+  ///
+  /// The server emits this on every node even when `hydrate=False`
+  /// (`sessionIds` in `tui_gateway/project_tree.py::_project_node`), so
+  /// placement never depends on whether a chat made the preview cut. This
+  /// is the ONLY wire source of per-chat ownership: there is no
+  /// top-level placement map on `projects.tree`.
+  final List<String> sessionIds;
 
   const ProjectOverviewNode({
     required this.id,
@@ -87,6 +96,7 @@ class ProjectOverviewNode {
     this.totalCostUsd = 0,
     this.repos = const [],
     this.previewSessions = const [],
+    this.sessionIds = const [],
   });
 
   factory ProjectOverviewNode.fromJson(Map<String, dynamic> json) {
@@ -117,6 +127,7 @@ class ProjectOverviewNode {
                 .toList(growable: false)
           : const <ProjectRepo>[],
       previewSessions: _sessions(json['previewSessions']),
+      sessionIds: _scopedIds(json['sessionIds']),
     );
   }
 
@@ -135,6 +146,16 @@ class ProjectsTreeOverview {
 
   /// Ids of chats some project already claims, in server order.
   final List<String> scopedSessionIds;
+
+  /// Full placement map: chat id -> owning project id (`__no_project__` for
+  /// the Home bucket), derived from every node's [ProjectOverviewNode
+  /// .sessionIds]. Unlike [ProjectOverviewNode.previewSessions] — a top-N
+  /// window — this names the owner of EVERY claimed chat, so a row label
+  /// never depends on whether the chat made the preview cut.
+  late final Map<String, String> sessionProjects = Map.unmodifiable({
+    for (final project in projects)
+      for (final id in project.sessionIds) id: project.id,
+  });
 
   final Set<String> _scoped;
 
@@ -174,6 +195,20 @@ class ProjectsTreeOverview {
       scopedSessionIds: _scopedIds(json['scoped_session_ids']),
     );
   }
+
+  /// The label of the project that owns [sessionId], or null when no project
+  /// claims it (or the owning node is the Home bucket, which is not a filing).
+  String? ownerLabelOf(String sessionId) {
+    final ownerId = sessionProjects[sessionId];
+    if (ownerId == null || ownerId == noProjectId) return null;
+    for (final project in projects) {
+      if (project.id == ownerId) return project.label;
+    }
+    return null;
+  }
+
+  /// The Home bucket id the backend's tree uses for unfiled chats.
+  static const String noProjectId = '__no_project__';
 
   /// Projects the user created, so the ones that accept server-side edits.
   List<ProjectOverviewNode> get userProjects =>

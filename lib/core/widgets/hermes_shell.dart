@@ -115,12 +115,18 @@ class HermesShell extends StatefulWidget {
 
 class _HermesShellState extends State<HermesShell> {
   late HermesDestination _current = widget.initialDestination;
+  late final Set<HermesDestination> _visitedDestinations = {
+    widget.initialDestination,
+  };
 
   void _select(HermesDestination destination) {
     // Re-tapping the active destination is a no-op rather than a rebuild or a
     // duplicate notification: callers use the callback for analytics/state.
     if (destination == _current) return;
-    setState(() => _current = destination);
+    setState(() {
+      _current = destination;
+      _visitedDestinations.add(destination);
+    });
     widget.onDestinationChanged?.call(destination);
   }
 
@@ -146,13 +152,22 @@ class _HermesShellState extends State<HermesShell> {
     final useRail =
         MediaQuery.sizeOf(context).width >= HermesShell.railBreakpoint;
 
-    final pane = AnimatedSwitcher(
-      duration: HermesMotion.fast,
-      switchInCurve: HermesMotion.curve,
-      child: KeyedSubtree(
-        key: ValueKey(_current),
-        child: widget.builder(context, _current),
-      ),
+    // Keep every visited destination mounted so local UI state (search text,
+    // selected filters, scroll position) survives switching away and back.
+    // Unvisited panes stay as inert placeholders: building all destinations
+    // eagerly would start their network reads before the user opens them.
+    final pane = IndexedStack(
+      index: _current.index,
+      children: [
+        for (final destination in HermesDestination.values)
+          if (_visitedDestinations.contains(destination))
+            KeyedSubtree(
+              key: ValueKey(destination),
+              child: widget.builder(context, destination),
+            )
+          else
+            const SizedBox.shrink(),
+      ],
     );
 
     if (useRail) {

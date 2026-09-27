@@ -20,6 +20,8 @@ String? _header(http.BaseRequest request, String name) {
   return null;
 }
 
+const _raceKey = 'race-test-key';
+
 class _BlockingStreamingClient extends http.BaseClient {
   bool cancelled = false;
   late final StreamController<List<int>> controller =
@@ -33,6 +35,60 @@ class _BlockingStreamingClient extends http.BaseClient {
   @override
   void close() {
     if (!controller.isClosed) controller.close();
+  }
+}
+
+class _PreHeaderHangingClient extends http.BaseClient {
+  final Completer<void> requestStarted = Completer<void>();
+  final Completer<void> releaseRequest = Completer<void>();
+  http.BaseRequest? request;
+  bool abortObserved = false;
+  bool closed = false;
+
+  @override
+  Future<http.StreamedResponse> send(http.BaseRequest request) async {
+    this.request = request;
+    if (!requestStarted.isCompleted) requestStarted.complete();
+    if (request is http.AbortableRequest && request.abortTrigger != null) {
+      await Future.any<void>([
+        request.abortTrigger!.then((_) {
+          abortObserved = true;
+          throw http.RequestAbortedException(request.url);
+        }),
+        releaseRequest.future,
+      ]);
+    } else {
+      await releaseRequest.future;
+    }
+    return http.StreamedResponse(const Stream<List<int>>.empty(), 200);
+  }
+
+  @override
+  void close() {
+    closed = true;
+    if (!releaseRequest.isCompleted) releaseRequest.complete();
+  }
+}
+
+/// Returns a FRESH stream controller per request so a test can keep the
+/// first response's stream alive while a second send starts.
+class _MultiStreamingClient extends http.BaseClient {
+  final List<StreamController<List<int>>> controllers = [];
+
+  StreamController<List<int>> get latest => controllers.last;
+
+  @override
+  Future<http.StreamedResponse> send(http.BaseRequest request) async {
+    final controller = StreamController<List<int>>();
+    controllers.add(controller);
+    return http.StreamedResponse(controller.stream, 200);
+  }
+
+  @override
+  void close() {
+    for (final c in controllers) {
+      if (!c.isClosed) c.close();
+    }
   }
 }
 
@@ -151,11 +207,13 @@ Future<void> _expectFailClosedPromptDisconnect(
   try {
     await client.connect().timeout(const Duration(seconds: 5));
     Object? surfacedError;
+    var sentCount = 0;
     try {
       await client.submitPrompt(
         'Synthetic disconnect prompt',
         sessionId: 'disconnect-session',
         onEvent: events.add,
+        onSent: () => sentCount += 1,
         timeout: const Duration(seconds: 5),
       );
     } catch (error) {
@@ -171,6 +229,7 @@ Future<void> _expectFailClosedPromptDisconnect(
     );
     expect((surfacedError as JsonRpcError).reason, 'connection_closed');
     expect(connectionCount, 1);
+    expect(sentCount, 1);
     expect(requests, hasLength(1));
     expect(requests.single['params'], {
       'session_id': 'disconnect-session',
@@ -189,6 +248,18 @@ Future<void> _expectFailClosedPromptDisconnect(
     await server.close(force: true);
   }
 }
+
+Map<String, dynamic> _archivedRow(String id) => {
+  'id': id,
+  'title': 'Archived $id',
+  'model': 'gpt-oss-20b',
+  'source': 'gateway',
+  'message_count': 2,
+  'preview': 'archived preview',
+  'started_at': 1750000000,
+  'last_active': 1750000000,
+  'archived': true,
+};
 
 void main() {
   group('SavedConnection', () {
@@ -696,6 +767,127 @@ void main() {
         api.close();
       },
     );
+
+    test(
+      'cancels promptly while SSE response headers are still pending',
+      () async {
+        final transport = _PreHeaderHangingClient();
+        final api = ApiClient(
+          baseUrl: 'http://hermes.local:8642',
+          apiKey: _raceKey,
+          httpClient: transport,
+        );
+        final gateway = GatewayChatClient(api);
+        var done = false;
+        String? error;
+
+        final sending = gateway.sendMessageStreaming(
+          message: 'waiting for headers',
+          sessionId: 'mob-pre-header-cancel',
+          onToken: (_) {},
+          onDone: () => done = true,
+          onError: (value) => error = value,
+        );
+        await transport.requestStarted.future;
+
+        expect(await gateway.cancelActiveMessage(), isTrue);
+        Object? settleFailure;
+        try {
+          await sending.timeout(const Duration(milliseconds: 250));
+        } catch (failure) {
+          settleFailure = failure;
+        }
+        if (!transport.releaseRequest.isCompleted) {
+          transport.releaseRequest.complete();
+        }
+        await sending;
+
+        expect(transport.request, isA<http.AbortableRequest>());
+        expect(transport.abortObserved, isTrue);
+        expect(
+          settleFailure,
+          isNull,
+          reason: 'cancellation must not wait for response headers',
+        );
+        expect(
+          transport.closed,
+          isFalse,
+          reason: 'cancelling one send must keep the shared client usable',
+        );
+        expect(done, isFalse);
+        expect(error, isNull);
+        api.close();
+      },
+    );
+
+    test('cancel-then-resend never reports the cancelled turn as done and '
+        'never leaks its tokens into the new stream', () async {
+      final transport = _MultiStreamingClient();
+      final api = ApiClient(
+        baseUrl: 'http://hermes.local:8642',
+        apiKey: _raceKey,
+        httpClient: transport,
+      );
+      final gateway = GatewayChatClient(api);
+      final firstToken = Completer<void>();
+      var firstDone = false;
+      var secondDone = false;
+      final firstTokens = <String>[];
+      final secondTokens = <String>[];
+
+      final firstSending = gateway.sendMessageStreaming(
+        message: 'first',
+        sessionId: 'mob-race-1',
+        onToken: (t) {
+          firstTokens.add(t);
+          if (!firstToken.isCompleted) firstToken.complete();
+        },
+        onDone: () => firstDone = true,
+        onError: (_) {},
+      );
+      transport.controllers.first.add(
+        utf8.encode('data: {"choices":[{"delta":{"content":"one"}}]}\n\n'),
+      );
+      await firstToken.future;
+
+      // Cancel the first, then IMMEDIATELY start a second send — the
+      // old shared-flag design reset _activeStreamCancelled=false in
+      // the second call before the first call's post-await check ran,
+      // so the cancelled first turn reported onDone.
+      expect(await gateway.cancelActiveMessage(), isTrue);
+      final secondSending = gateway.sendMessageStreaming(
+        message: 'second',
+        sessionId: 'mob-race-2',
+        onToken: secondTokens.add,
+        onDone: () => secondDone = true,
+        onError: (_) {},
+      );
+      // Let the first call unwind fully with the second already active.
+      await firstSending;
+      expect(
+        firstDone,
+        isFalse,
+        reason: 'a cancelled turn must never report completion',
+      );
+
+      // The orphaned first stream pushing late tokens must not reach
+      // any callback: the first stream's controller is still open but
+      // its subscription was cancelled; the second stream gets its own.
+      transport.latest.add(
+        utf8.encode('data: {"choices":[{"delta":{"content":"two"}}]}\n\n'),
+      );
+      await pumpEventQueue();
+      expect(secondTokens, ['two']);
+      expect(firstTokens, [
+        'one',
+      ], reason: 'first stream delivered nothing after cancellation');
+
+      // Second stream completes normally.
+      await transport.latest.close();
+      await secondSending;
+      expect(secondDone, isTrue);
+      api.close();
+    });
   });
 
   group('Desktop gateway URL derivation', () {
@@ -780,6 +972,461 @@ void main() {
       expect(DashboardClient.buildCronUpdateBody(updates), {
         'updates': updates,
       });
+    });
+
+    test('scopes every cron operation to the connection profile', () async {
+      final requests = <http.Request>[];
+      final client = DashboardClient(
+        host: 'hermes.local',
+        port: 9119,
+        proxied: true,
+        gatewayProfile: 'research',
+        httpClient: MockClient((request) async {
+          requests.add(request);
+          if (request.url.path == '/api/cron/jobs') {
+            if (request.method == 'GET') return http.Response('[]', 200);
+            return http.Response('{"id":"job-1"}', 200);
+          }
+          if (request.url.path.endsWith('/runs')) {
+            return http.Response('{"runs":[],"limit":20}', 200);
+          }
+          return http.Response('{}', 200);
+        }),
+      );
+
+      await client.getCronJobs();
+      await client.getCronJobRuns('job-1');
+      await client.createJob(
+        name: 'Scoped job',
+        prompt: 'Do scoped work',
+        schedule: '0 9 * * *',
+      );
+      await client.updateJob('job-1', {'name': 'Updated'});
+      await client.setJobPaused('job-1', paused: true);
+      await client.setJobPaused('job-1', paused: false);
+      await client.triggerJob('job-1');
+      await client.deleteJob('job-1');
+
+      expect(requests, hasLength(8));
+      for (final request in requests) {
+        expect(
+          request.url.queryParameters['profile'],
+          'research',
+          reason:
+              '${request.method} ${request.url.path} must stay profile-scoped',
+        );
+      }
+      expect(requests[1].url.queryParameters['limit'], '20');
+      expect(jsonDecode(requests[2].body), {
+        'prompt': 'Do scoped work',
+        'schedule': '0 9 * * *',
+        'name': 'Scoped job',
+        'deliver': 'local',
+      });
+      expect(jsonDecode(requests[3].body), {
+        'updates': {'name': 'Updated'},
+      });
+      expect(requests[4].url.path, '/api/cron/jobs/job-1/pause');
+      expect(requests[5].url.path, '/api/cron/jobs/job-1/resume');
+      expect(requests[6].url.path, '/api/cron/jobs/job-1/trigger');
+      expect(requests[7].method, 'DELETE');
+      client.close();
+    });
+
+    test('updateJob times out when response headers never arrive', () async {
+      final never = Completer<http.Response>();
+      final client = DashboardClient(
+        host: 'hermes.local',
+        port: 9119,
+        proxied: true,
+        httpClient: MockClient((_) => never.future),
+      );
+
+      await expectLater(
+        client.updateJob('job-1', {
+          'name': 'Still bounded',
+        }, timeout: const Duration(milliseconds: 25)),
+        throwsA(isA<TimeoutException>()),
+      );
+      client.close();
+    });
+
+    test('getCronJobRuns parses the dashboard runs envelope', () async {
+      final client = DashboardClient(
+        host: 'hermes.local',
+        port: 9119,
+        username: 'misha',
+        password: 'secret',
+        httpClient: MockClient((request) async {
+          if (request.url.path == '/auth/password-login') {
+            return http.Response(
+              '{"ok":true}',
+              200,
+              headers: {
+                'set-cookie':
+                    'hermes_session_at=TOK123; Path=/; HttpOnly; SameSite=Lax',
+              },
+            );
+          }
+          if (request.url.path == '/api/cron/jobs/nightly%20report/runs') {
+            expect(request.url.queryParameters['limit'], '20');
+            return http.Response(
+              jsonEncode({
+                'runs': [
+                  {
+                    'id': 'cron_nightly_1750000000',
+                    'title': 'Nightly report run',
+                    'model': 'claude-opus-5',
+                    'source': 'cron',
+                    'message_count': 4,
+                    'started_at': 1750000000,
+                    'last_active': 1750000123,
+                    'preview': 'Report generated',
+                    'ended_at': 1750000123,
+                  },
+                ],
+                'limit': 20,
+              }),
+              200,
+            );
+          }
+          return http.Response('not found', 404);
+        }),
+      );
+
+      final runs = await client.getCronJobRuns('nightly report');
+
+      expect(runs, hasLength(1));
+      expect(runs.single.id, 'cron_nightly_1750000000');
+      expect(runs.single.source, 'cron');
+      expect(runs.single.isActive, isFalse);
+      expect(runs.single.lastActive, 1750000123);
+      client.close();
+    });
+
+    test('getArchivedSessions dedupes repeated pins and pages until the '
+        'filtered total is covered', () async {
+      // 150 archived window rows + 1 pin repeated on every page, total
+      // 151. Termination is TOTAL-driven (the dashboard router counts the
+      // filtered rows, pins included, and the LIMIT/OFFSET windows cover
+      // exactly that many rows): advance offsets until offset >= total —
+      // no no-progress probe page is needed, and a pin-only window can
+      // never be mistaken for the end.
+      final requestedOffsets = <String>[];
+      final client = DashboardClient(
+        host: 'hermes.local',
+        port: 9119,
+        username: 'misha',
+        password: 'secret',
+        httpClient: MockClient((request) async {
+          if (request.url.path == '/auth/password-login') {
+            return http.Response(
+              '{"ok":true}',
+              200,
+              headers: {
+                'set-cookie':
+                    'hermes_session_at=TOK123; Path=/; HttpOnly; SameSite=Lax',
+              },
+            );
+          }
+          if (request.url.path == '/api/sessions' &&
+              request.url.queryParameters['archived'] == 'only') {
+            final offset = int.parse(request.url.queryParameters['offset']!);
+            requestedOffsets.add(request.url.queryParameters['offset']!);
+            final limit = int.parse(request.url.queryParameters['limit']!);
+            final rows = [
+              for (var i = offset; i < offset + limit && i < 150; i++)
+                _archivedRow('a$i'),
+            ];
+            // The pin repeats on every page (back-fill semantics).
+            final withPin = [
+              _archivedRow('pin-x'),
+              if (!rows.any((r) => r['id'] == 'pin-x')) ...rows,
+            ];
+            return http.Response(
+              jsonEncode({
+                'sessions': withPin,
+                'total': 151,
+                'limit': limit,
+                'offset': offset,
+              }),
+              200,
+            );
+          }
+          return http.Response('not found', 404);
+        }),
+      );
+
+      final sessions = await client.getArchivedSessions(pageSize: 100);
+
+      // Windows 0 and 100 cover the total of 151 — no terminal
+      // no-progress probe is needed once the offset covers `total`.
+      expect(requestedOffsets, ['0', '100']);
+      // 150 window rows + 1 pin, deduped — never the inflated 153.
+      expect(sessions, hasLength(151));
+      final ids = sessions.map((s) => s.id).toSet();
+      expect(ids.length, 151, reason: 'no duplicate ids');
+      expect(ids.contains('pin-x'), isTrue);
+      expect(ids.contains('a149'), isTrue);
+      client.close();
+    });
+
+    test('getArchivedSessions keeps paging past a pin-only window when '
+        'total says rows remain', () async {
+      // The reviewer's blocker #1 shape on the archived path: a base
+      // window made entirely of already-seen pins contributes zero new
+      // ids while unseen rows still sit at a further offset. A
+      // no-progress stop would truncate the archive; total-driven paging
+      // walks straight over it.
+      final requestedOffsets = <String>[];
+      final client = DashboardClient(
+        host: 'hermes.local',
+        port: 9119,
+        username: 'misha',
+        password: 'secret',
+        httpClient: MockClient((request) async {
+          if (request.url.path == '/auth/password-login') {
+            return http.Response(
+              '{"ok":true}',
+              200,
+              headers: {
+                'set-cookie':
+                    'hermes_session_at=TOK123; Path=/; HttpOnly; SameSite=Lax',
+              },
+            );
+          }
+          if (request.url.path == '/api/sessions' &&
+              request.url.queryParameters['archived'] == 'only') {
+            final offset = int.parse(request.url.queryParameters['offset']!);
+            requestedOffsets.add(request.url.queryParameters['offset']!);
+            final limit = int.parse(request.url.queryParameters['limit']!);
+            // The two pins ride EVERY page (stock back-fill semantics).
+            final pins = [_archivedRow('pin-a'), _archivedRow('pin-b')];
+            final windowRows = [
+              for (var i = offset; i < offset + limit && i < 210; i++)
+                if (offset != 100) _archivedRow('a$i'),
+              // The window at offset 100 is a pure repeat: only the
+              // pins, zero fresh rows, while a200+ still sit ahead.
+            ];
+            return http.Response(
+              jsonEncode({
+                'sessions': [...pins, ...windowRows],
+                'total': 212,
+                'limit': limit,
+                'offset': offset,
+              }),
+              200,
+            );
+          }
+          return http.Response('not found', 404);
+        }),
+      );
+
+      final sessions = await client.getArchivedSessions(pageSize: 100);
+
+      // The zero-new page at offset 100 did NOT stop the walk: offsets
+      // 0, 100, 200 were all read and the tail rows made it in.
+      expect(requestedOffsets, ['0', '100', '200']);
+      // 110 window rows (a0-a99, a200-a209; the offset-100 window is
+      // pure pin repeats) + 2 pins, deduped.
+      expect(sessions, hasLength(112));
+      expect(sessions.map((s) => s.id), contains('a209'));
+      client.close();
+    });
+
+    test('getArchivedSessions without a total falls back to the pin-bound '
+        'proof and walks past a pin-only window', () async {
+      // The fallback branch (non-standard router that omits `total`):
+      // termination is the k-consecutive-zero-new-pages rule bounded by
+      // the max pins seen on any page. Reviewer shape at pageSize 2:
+      // window rows a0..a5 with a2,a3 pinned; the offset-2 window is
+      // pure pin repeats (zero new) while a4,a5 sit at offset 4.
+      // required = 2 ~/ 2 + 1 = 2 consecutive zero-new pages.
+      final requestedOffsets = <String>[];
+      final client = DashboardClient(
+        host: 'hermes.local',
+        port: 9119,
+        username: 'misha',
+        password: 'secret',
+        httpClient: MockClient((request) async {
+          if (request.url.path == '/auth/password-login') {
+            return http.Response(
+              '{"ok":true}',
+              200,
+              headers: {
+                'set-cookie':
+                    'hermes_session_at=TOK123; Path=/; HttpOnly; SameSite=Lax',
+              },
+            );
+          }
+          if (request.url.path == '/api/sessions' &&
+              request.url.queryParameters['archived'] == 'only') {
+            final offset = int.parse(request.url.queryParameters['offset']!);
+            requestedOffsets.add(request.url.queryParameters['offset']!);
+            final limit = int.parse(request.url.queryParameters['limit']!);
+            final window = [
+              for (var i = offset; i < offset + limit && i < 6; i++)
+                _archivedRow('a$i'),
+            ];
+            // Pins (a2, a3) back-filled on EVERY page.
+            final pins = [_archivedRow('a2'), _archivedRow('a3')]
+              ..forEach((p) => p['pinned'] = true);
+            final withPins = [
+              ...window,
+              for (final p in pins)
+                if (!window.any((r) => r['id'] == p['id'])) p,
+            ];
+            // NO 'total' key — forces the client-side proof branch.
+            return http.Response(
+              jsonEncode({
+                'sessions': withPins,
+                'limit': limit,
+                'offset': offset,
+              }),
+              200,
+            );
+          }
+          return http.Response('not found', 404);
+        }),
+      );
+
+      final sessions = await client.getArchivedSessions(pageSize: 2);
+
+      // The zero-new window at offset 2 did NOT end the walk: a4/a5
+      // were reached. (A mutant that required only ONE zero-new page —
+      // e.g. flipping the pinBound==0 ternary or dropping the +1 —
+      // stops at offset 4 and loses them.)
+      expect(requestedOffsets, contains('4'));
+      final ids = sessions.map((s) => s.id).toSet();
+      expect(ids, containsAll(<String>['a0', 'a1', 'a2', 'a3', 'a4', 'a5']));
+      expect(ids.length, 6, reason: 'pins deduped');
+      client.close();
+    });
+
+    test('getArchivedSessions stops exactly when the offset covers total '
+        '(no extra probe request at the boundary)', () async {
+      // total = 200, pageSize = 100: after the page at offset 100 the
+      // next offset (200) covers the total, so `offset >= total` must
+      // break WITHOUT issuing a third request. A `>` mutant issues one
+      // extra page past the end.
+      final requestedOffsets = <String>[];
+      final client = DashboardClient(
+        host: 'hermes.local',
+        port: 9119,
+        username: 'misha',
+        password: 'secret',
+        httpClient: MockClient((request) async {
+          if (request.url.path == '/auth/password-login') {
+            return http.Response(
+              '{"ok":true}',
+              200,
+              headers: {
+                'set-cookie':
+                    'hermes_session_at=TOK123; Path=/; HttpOnly; SameSite=Lax',
+              },
+            );
+          }
+          if (request.url.path == '/api/sessions' &&
+              request.url.queryParameters['archived'] == 'only') {
+            final offset = int.parse(request.url.queryParameters['offset']!);
+            requestedOffsets.add(request.url.queryParameters['offset']!);
+            final limit = int.parse(request.url.queryParameters['limit']!);
+            final rows = [
+              for (var i = offset; i < offset + limit && i < 200; i++)
+                _archivedRow('a$i'),
+            ];
+            return http.Response(
+              jsonEncode({
+                'sessions': rows,
+                'total': 200,
+                'limit': limit,
+                'offset': offset,
+              }),
+              200,
+            );
+          }
+          return http.Response('not found', 404);
+        }),
+      );
+
+      final sessions = await client.getArchivedSessions(pageSize: 100);
+
+      expect(requestedOffsets, [
+        '0',
+        '100',
+      ], reason: 'offset 200 covers total=200; no third request');
+      expect(sessions, hasLength(200));
+      client.close();
+    });
+
+    test('getArchivedSessions throws rather than present a cap-truncated '
+        'archive as complete', () async {
+      // A store that never ends: every page carries fresh rows. The
+      // maxPages cap must surface an error, not a silent partial list.
+      final client = DashboardClient(
+        host: 'hermes.local',
+        port: 9119,
+        username: 'misha',
+        password: 'secret',
+        httpClient: MockClient((request) async {
+          if (request.url.path == '/auth/password-login') {
+            return http.Response(
+              '{"ok":true}',
+              200,
+              headers: {
+                'set-cookie':
+                    'hermes_session_at=TOK123; Path=/; HttpOnly; SameSite=Lax',
+              },
+            );
+          }
+          if (request.url.path == '/api/sessions') {
+            final offset = int.parse(request.url.queryParameters['offset']!);
+            final limit = int.parse(request.url.queryParameters['limit']!);
+            return http.Response(
+              jsonEncode({
+                'sessions': [
+                  for (var i = offset; i < offset + limit; i++)
+                    _archivedRow('endless$i'),
+                ],
+                'total': 999999,
+              }),
+              200,
+            );
+          }
+          return http.Response('not found', 404);
+        }),
+      );
+
+      expect(
+        client.getArchivedSessions(pageSize: 100, maxPages: 3),
+        throwsStateError,
+      );
+      client.close();
+    });
+
+    test('getCronJobRuns returns empty for a job with no runs', () async {
+      final client = DashboardClient(
+        host: 'hermes.local',
+        port: 9119,
+        username: 'misha',
+        password: 'secret',
+        httpClient: MockClient((request) async {
+          if (request.url.path == '/auth/password-login') {
+            return http.Response(
+              '{"ok":true}',
+              200,
+              headers: {
+                'set-cookie':
+                    'hermes_session_at=TOK123; Path=/; HttpOnly; SameSite=Lax',
+              },
+            );
+          }
+          return http.Response('{"runs": [], "limit": 20}', 200);
+        }),
+      );
+
+      expect(await client.getCronJobRuns('fresh-job'), isEmpty);
+      client.close();
     });
 
     test(
@@ -889,6 +1536,73 @@ void main() {
       expect(loginCalls, 2);
       client.close();
     });
+
+    test(
+      'concurrent stale 401 responses share one replacement login',
+      () async {
+        var loginCalls = 0;
+        var staleApiCalls = 0;
+        var apiCalls = 0;
+        final bothStaleRequestsStarted = Completer<void>();
+        final releaseReplacementLogin = Completer<void>();
+        final client = DashboardClient(
+          host: 'hermes.local',
+          port: 30433,
+          username: 'misha',
+          password: 'secret',
+          httpClient: MockClient((request) async {
+            if (request.url.path == '/auth/password-login') {
+              loginCalls++;
+              if (loginCalls == 2) {
+                Future<void>.delayed(const Duration(milliseconds: 25), () {
+                  if (!releaseReplacementLogin.isCompleted) {
+                    releaseReplacementLogin.complete();
+                  }
+                });
+                await releaseReplacementLogin.future;
+              }
+              return http.Response(
+                '{"ok":true}',
+                200,
+                headers: {
+                  'set-cookie':
+                      'hermes_session_at=TOK$loginCalls; Path=/; HttpOnly',
+                },
+              );
+            }
+            if (request.url.path.startsWith('/api/')) {
+              apiCalls++;
+              if (_header(request, 'cookie') == 'hermes_session_at=TOK1') {
+                staleApiCalls++;
+                if (staleApiCalls == 2 &&
+                    !bothStaleRequestsStarted.isCompleted) {
+                  bothStaleRequestsStarted.complete();
+                }
+                await bothStaleRequestsStarted.future;
+                return http.Response('unauthorized', 401);
+              }
+              return http.Response('{"ok":true}', 200);
+            }
+            return http.Response('not found', 404);
+          }),
+        );
+
+        final results = await Future.wait([
+          client.apiGet('first'),
+          client.apiGet('second'),
+        ]);
+
+        expect(results, everyElement({'ok': true}));
+        expect(staleApiCalls, 2);
+        expect(apiCalls, 4, reason: 'each request retries at most once');
+        expect(
+          loginCalls,
+          2,
+          reason: 'initial login plus one shared replacement login',
+        );
+        client.close();
+      },
+    );
 
     test('surfaces invalid dashboard credentials', () async {
       final client = DashboardClient(
@@ -2034,7 +2748,7 @@ void main() {
       }
     });
 
-    test('preserves mobile source_profile on generic file.attach', () async {
+    test('file.attach sends only stock FileAttachParams wire keys', () async {
       final server = await HttpServer.bind(InternetAddress.loopbackIPv4, 0);
       final requestSeen = Completer<Map<String, dynamic>>();
       final socketSubscription = server
@@ -2064,19 +2778,18 @@ void main() {
           sessionId: 'gateway-session-123',
           name: 'fixture.txt',
           dataUrl: 'data:application/octet-stream;base64,ZmFrZQ==',
-          sourceChannel: 'hermes_mobile',
-          sourceProfile: 'pro',
         );
         final request = await requestSeen.future;
 
+        // Stock Hermes FileAttachParams is extra="forbid"; sending
+        // source_channel/source_profile (fixture-only keys) makes every
+        // attach fail with "Extra inputs are not permitted".
         expect(request['method'], 'file.attach');
         expect(request['params'], {
           'session_id': 'gateway-session-123',
           'name': 'fixture.txt',
           'path': '',
           'data_url': 'data:application/octet-stream;base64,ZmFrZQ==',
-          'source_channel': 'hermes_mobile',
-          'source_profile': 'pro',
         });
       } finally {
         client.close();
@@ -2098,7 +2811,16 @@ void main() {
                 jsonEncode({
                   'jsonrpc': '2.0',
                   'id': request['id'],
-                  'result': {'session_id': 'runtime-123'},
+                  'result': {
+                    'session_id': 'runtime-123',
+                    'running': false,
+                    'status': 'idle',
+                    'inflight': {
+                      'status': 'error',
+                      'error': 'Provider unavailable',
+                      'recoverable': true,
+                    },
+                  },
                 }),
               );
             });
@@ -2107,7 +2829,15 @@ void main() {
 
       try {
         await client.connect();
-        expect(await client.resumeSession('stored-123'), 'runtime-123');
+        final resumed = await client.resumeSessionDetails('stored-123');
+        expect(resumed.runtimeSessionId, 'runtime-123');
+        expect(resumed.running, isFalse);
+        expect(resumed.status, 'idle');
+        expect(resumed.inflight, {
+          'status': 'error',
+          'error': 'Provider unavailable',
+          'recoverable': true,
+        });
         final request = await requestSeen.future;
         expect(request['method'], 'session.resume');
         expect(request['params'], {'session_id': 'stored-123'});
@@ -2291,6 +3021,7 @@ void main() {
               sessionId: 'mobile-project',
               text: 'hello',
               onEvent: (_) {},
+              onSent: () {},
             )
             .then<void>((_) {}, onError: (_) {});
 
@@ -2360,6 +3091,58 @@ void main() {
           expect(resumeCalls, hasLength(2));
           expect(resumeCalls.first['params'], {'session_id': 'mobile-project'});
           expect(resumeCalls.last['params'], {'session_id': 'stored-project'});
+        },
+      );
+
+      test(
+        'a retained resume failure emits one terminal async event',
+        () async {
+          final client = buildClient();
+          addTearDown(client.close);
+
+          await client.ensureSession(
+            'mobile-project',
+            workingDirectory: '/srv/projects/hermes-android',
+          );
+          await expectSoon(
+            () => fixture.knownStoredIds.contains('stored-project'),
+            reason: 'session.create minting the stored identity',
+          );
+          fixture
+            ..resumeKnownIds.add('stored-project')
+            ..resumeInflight = {
+              'status': 'error',
+              'error': 'Provider unavailable',
+              'recoverable': true,
+            };
+
+          final events = <StreamEvent>[];
+          final states = <DesktopConnectionState>[];
+          client
+            ..setAsyncEventListener((mobileSessionId, event) {
+              expect(mobileSessionId, 'mobile-project');
+              events.add(event);
+            })
+            ..setConnectionListener(states.add);
+
+          await fixture.openSockets.single.close();
+          await expectSoon(
+            () => states.contains(DesktopConnectionState.disconnected),
+            reason: 'client observing the dropped socket',
+          );
+          await client.ensureSession('mobile-project');
+          await expectSoon(
+            () => events.any((event) => event.type == 'turn.error'),
+            reason: 'retained terminal failure delivery',
+          );
+
+          final failures = events
+              .where((event) => event.type == 'turn.error')
+              .toList();
+          expect(failures, hasLength(1));
+          expect(failures.single.isComplete, isTrue);
+          expect(failures.single.data['message'], 'Provider unavailable');
+          expect(failures.single.data['status'], 'error');
         },
       );
     });
@@ -2853,6 +3636,7 @@ class _ProjectGatewayFixture {
   final perSocketRequests = <List<Map<String, dynamic>>>[];
   final knownStoredIds = <String>{};
   final resumeKnownIds = <String>{};
+  Map<String, dynamic>? resumeInflight;
   var ticketCount = 0;
 
   void safeAdd(WebSocket socket, Map<String, dynamic> frame) {
@@ -2881,7 +3665,12 @@ class _ProjectGatewayFixture {
             safeAdd(socket, {
               'jsonrpc': '2.0',
               'id': request['id'],
-              'result': {'session_id': 'runtime-resumed'},
+              'result': {
+                'session_id': 'runtime-resumed',
+                'running': false,
+                'status': resumeInflight == null ? 'idle' : 'working',
+                'inflight': ?resumeInflight,
+              },
             });
           } else {
             safeAdd(socket, {
