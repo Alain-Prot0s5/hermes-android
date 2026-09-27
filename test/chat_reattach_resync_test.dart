@@ -295,6 +295,7 @@ void main() {
     (tester) async {
       final hook = TestDesktopConnectionHook();
       final submission = Completer<void>();
+      var ensureCount = 0;
       // Requests 2..7 stay user-only. Request 8 lands after the old
       // ten-attempt implementation would already have abandoned recovery.
       final history = _ReattachChatHttpClient()
@@ -312,7 +313,7 @@ void main() {
         tester,
         hook: hook,
         apiClient: apiClient,
-        ensureCount: () {},
+        ensureCount: () => ensureCount += 1,
         storedKey: 'stored_sess_longturn',
         remoteSubmit:
             ({
@@ -360,6 +361,7 @@ void main() {
       await tester.pump(const Duration(seconds: 12));
       expect(history.messageRequestCount, 7);
 
+      hook.handler?.call(DesktopConnectionState.reconnecting);
       tester.binding.handleAppLifecycleStateChanged(AppLifecycleState.paused);
       await tester.pump();
       history.userOnlyUntilRequest = 0;
@@ -373,10 +375,19 @@ void main() {
 
       tester.binding.handleAppLifecycleStateChanged(AppLifecycleState.hidden);
       tester.binding.handleAppLifecycleStateChanged(AppLifecycleState.inactive);
+      final ensuresBeforeResume = ensureCount;
       tester.binding.handleAppLifecycleStateChanged(AppLifecycleState.resumed);
       await tester.pump();
       await tester.pump(const Duration(milliseconds: 100));
 
+      expect(
+        ensureCount,
+        greaterThan(ensuresBeforeResume),
+        reason: 'resume must explicitly restart an exhausted socket loop',
+      );
+      hook.handler?.call(DesktopConnectionState.connected);
+      await tester.pump();
+      await tester.pump(const Duration(milliseconds: 100));
       expect(
         history.messageRequestCount,
         8,

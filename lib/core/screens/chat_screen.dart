@@ -485,6 +485,11 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
       _appInBackground = false;
       unawaited(_turnNotifications.cancelAll());
       if (_pendingReattachResync) {
+        // The transport's autonomous loop is normally enough, but an app
+        // resume is also an explicit recovery signal. Force the session path
+        // to restart a socket immediately after any prolonged offline period;
+        // the history retry itself remains gated on the connected callback.
+        unawaited(_ensureDesktopSession());
         _requestImmediateReattachResync();
       } else if (_desktopGateway != null) {
         unawaited(_ensureDesktopSession());

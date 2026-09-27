@@ -313,16 +313,14 @@ class DesktopGatewayClient {
 
   /// Exponential-backoff reconnect loop, started when a previously-live
   /// socket drops. Runs independently of the UI: the socket is back before
-  /// the user opens the chat again. Stops on success, on client close, or
-  /// when the cap is hit (a later explicit action still retries via
-  /// _ensureSocket).
+  /// the user opens the chat again. Retries until success or client close;
+  /// detached-turn recovery has no safe deadline after which a reply may be
+  /// abandoned. The delay remains capped so a long outage does not spin.
   void _scheduleReconnect() {
     if (_closed || _reconnectTimer != null) return;
-    if (_reconnectAttempts >= 8) return;
     _reconnectAttempts++;
-    final delay = Duration(
-      seconds: (1 << (_reconnectAttempts - 1)).clamp(2, 30),
-    );
+    final exponent = _reconnectAttempts.clamp(1, 5);
+    final delay = Duration(seconds: (1 << (exponent - 1)).clamp(2, 30));
     _reconnectTimer = Timer(delay, () async {
       _reconnectTimer = null;
       if (_closed) return;

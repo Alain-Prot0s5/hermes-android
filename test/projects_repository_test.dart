@@ -446,6 +446,535 @@ void main() {
       },
     );
 
+    test(
+      'a rename completing after create preserves the created project',
+      () async {
+        final createResponse = Completer<Map<String, dynamic>>();
+        final renameResponse = Completer<Map<String, dynamic>>();
+        final preferences = await SharedPreferences.getInstance();
+        final client = ProjectsGatewayClient((method, params) {
+          switch (method) {
+            case 'projects.list':
+              return Future.value(
+                _FakeGateway._ok({
+                  'projects': [_projectJson(id: 'old', name: 'Old')],
+                  'active_id': null,
+                }),
+              );
+            case 'projects.create':
+              return createResponse.future;
+            case 'projects.update':
+              return renameResponse.future;
+            default:
+              return Future.value(_FakeGateway._ok(const {}));
+          }
+        });
+        final repo = ProjectsRepository(
+          client: client,
+          preferences: preferences,
+          connectionId: 'gateway-a',
+        );
+        await repo.refresh();
+
+        final create = repo.create('New');
+        final rename = repo.rename('old', 'Renamed');
+        createResponse.complete(
+          _FakeGateway._ok({'project': _projectJson(id: 'new', name: 'New')}),
+        );
+        await create;
+        renameResponse.complete(
+          _FakeGateway._ok({
+            'project': _projectJson(id: 'old', name: 'Renamed'),
+          }),
+        );
+        await rename;
+
+        expect(
+          repo.current.projects.map(
+            (project) => '${project.id}:${project.name}',
+          ),
+          ['old:Renamed', 'new:New'],
+        );
+        final restarted = ProjectsRepository(
+          client: client,
+          preferences: preferences,
+          connectionId: 'gateway-a',
+        );
+        expect(
+          (await restarted.loadCached()).projects.map((project) => project.id),
+          ['old', 'new'],
+        );
+      },
+    );
+
+    test(
+      'an archive snapshot preserves a create that completed while in flight',
+      () async {
+        final createResponse = Completer<Map<String, dynamic>>();
+        final archiveResponse = Completer<Map<String, dynamic>>();
+        final client = ProjectsGatewayClient((method, params) {
+          switch (method) {
+            case 'projects.list':
+              return Future.value(
+                _FakeGateway._ok({
+                  'projects': [_projectJson(id: 'old', name: 'Old')],
+                  'active_id': null,
+                }),
+              );
+            case 'projects.create':
+              return createResponse.future;
+            case 'projects.archive':
+              return archiveResponse.future;
+            default:
+              return Future.value(_FakeGateway._ok(const {}));
+          }
+        });
+        final repo = ProjectsRepository(
+          client: client,
+          preferences: await SharedPreferences.getInstance(),
+          connectionId: 'gateway-a',
+        );
+        await repo.refresh();
+
+        final create = repo.create('New');
+        final archive = repo.archive('old');
+        createResponse.complete(
+          _FakeGateway._ok({'project': _projectJson(id: 'new', name: 'New')}),
+        );
+        await create;
+        archiveResponse.complete(
+          _FakeGateway._ok({
+            'projects': [
+              {..._projectJson(id: 'old', name: 'Old'), 'archived': true},
+            ],
+            'active_id': null,
+          }),
+        );
+        await archive;
+
+        expect(repo.current.projects.map((project) => project.id), ['new']);
+        expect(repo.current.archived.map((project) => project.id), ['old']);
+      },
+    );
+
+    test(
+      'a failed rename rolls back memory and cache after a concurrent create',
+      () async {
+        final createResponse = Completer<Map<String, dynamic>>();
+        final renameResponse = Completer<Map<String, dynamic>>();
+        final preferences = await SharedPreferences.getInstance();
+        final client = ProjectsGatewayClient((method, params) {
+          switch (method) {
+            case 'projects.list':
+              return Future.value(
+                _FakeGateway._ok({
+                  'projects': [_projectJson(id: 'old', name: 'Before')],
+                  'active_id': null,
+                }),
+              );
+            case 'projects.create':
+              return createResponse.future;
+            case 'projects.update':
+              return renameResponse.future;
+            default:
+              return Future.value(_FakeGateway._ok(const {}));
+          }
+        });
+        final repo = ProjectsRepository(
+          client: client,
+          preferences: preferences,
+          connectionId: 'gateway-a',
+        );
+        await repo.refresh();
+
+        final rename = repo.rename('old', 'After');
+        final create = repo.create('New');
+        createResponse.complete(
+          _FakeGateway._ok({'project': _projectJson(id: 'new', name: 'New')}),
+        );
+        await create;
+        final whilePending = ProjectsRepository(
+          client: client,
+          preferences: preferences,
+          connectionId: 'gateway-a',
+        );
+        expect(
+          (await whilePending.loadCached()).projects.map(
+            (project) => '${project.id}:${project.name}',
+          ),
+          ['old:Before', 'new:New'],
+          reason: 'an optimistic rename must never become durable',
+        );
+        renameResponse.completeError(_offline);
+        await expectLater(rename, throwsA(isA<JsonRpcError>()));
+
+        expect(
+          repo.current.projects.map(
+            (project) => '${project.id}:${project.name}',
+          ),
+          ['old:Before', 'new:New'],
+        );
+        final restarted = ProjectsRepository(
+          client: client,
+          preferences: preferences,
+          connectionId: 'gateway-a',
+        );
+        expect(
+          (await restarted.loadCached()).projects.map(
+            (project) => '${project.id}:${project.name}',
+          ),
+          ['old:Before', 'new:New'],
+        );
+      },
+    );
+
+    test(
+      'two failed renames serialize against the last confirmed baseline',
+      () async {
+        final renameResponses = <Completer<Map<String, dynamic>>>[];
+        final client = ProjectsGatewayClient((method, params) {
+          if (method == 'projects.list') {
+            return Future.value(
+              _FakeGateway._ok({
+                'projects': [_projectJson(id: 'old', name: 'Original')],
+                'active_id': null,
+              }),
+            );
+          }
+          if (method == 'projects.update') {
+            final response = Completer<Map<String, dynamic>>();
+            renameResponses.add(response);
+            return response.future;
+          }
+          return Future.value(_FakeGateway._ok(const {}));
+        });
+        final repo = ProjectsRepository(
+          client: client,
+          preferences: await SharedPreferences.getInstance(),
+          connectionId: 'gateway-a',
+        );
+        await repo.refresh();
+
+        final first = repo.rename('old', 'First optimistic');
+        final second = repo.rename('old', 'Second optimistic');
+        await Future<void>.delayed(Duration.zero);
+        expect(renameResponses, hasLength(1));
+        renameResponses.single.completeError(_offline);
+        await expectLater(first, throwsA(isA<JsonRpcError>()));
+        await Future<void>.delayed(Duration.zero);
+        expect(renameResponses, hasLength(2));
+        renameResponses.last.completeError(_offline);
+        await expectLater(second, throwsA(isA<JsonRpcError>()));
+
+        expect(repo.current.projects.single.name, 'Original');
+      },
+    );
+
+    test(
+      'a refresh cannot durably cache an optimistic delete that later fails',
+      () async {
+        final refreshResponse = Completer<Map<String, dynamic>>();
+        final deleteResponse = Completer<Map<String, dynamic>>();
+        var listCalls = 0;
+        final preferences = await SharedPreferences.getInstance();
+        final client = ProjectsGatewayClient((method, params) {
+          if (method == 'projects.list') {
+            listCalls++;
+            if (listCalls > 1) return refreshResponse.future;
+            return Future.value(
+              _FakeGateway._ok({
+                'projects': [_projectJson(id: 'p1', name: 'Kept')],
+                'active_id': null,
+              }),
+            );
+          }
+          if (method == 'projects.delete') return deleteResponse.future;
+          return Future.value(_FakeGateway._ok(const {}));
+        });
+        final repo = ProjectsRepository(
+          client: client,
+          preferences: preferences,
+          connectionId: 'gateway-a',
+        );
+        await repo.refresh();
+
+        final deletion = repo.delete('p1');
+        final refresh = repo.refresh();
+        refreshResponse.complete(
+          _FakeGateway._ok({
+            'projects': [_projectJson(id: 'p1', name: 'Kept')],
+            'active_id': null,
+          }),
+        );
+        await refresh;
+        final whilePending = ProjectsRepository(
+          client: client,
+          preferences: preferences,
+          connectionId: 'gateway-a',
+        );
+        expect(
+          (await whilePending.loadCached()).projects.map(
+            (project) => project.id,
+          ),
+          ['p1'],
+          reason: 'optimistic deletion must never become durable',
+        );
+        deleteResponse.completeError(_offline);
+        await expectLater(deletion, throwsA(isA<JsonRpcError>()));
+
+        final restarted = ProjectsRepository(
+          client: client,
+          preferences: preferences,
+          connectionId: 'gateway-a',
+        );
+        expect(
+          (await restarted.loadCached()).projects.map((project) => project.id),
+          ['p1'],
+        );
+      },
+    );
+
+    test(
+      'a failed refresh keeps confirmed memory instead of an older cache',
+      () async {
+        var failList = false;
+        final offline = _offline;
+        final preferences = await SharedPreferences.getInstance();
+        final client = ProjectsGatewayClient((method, params) {
+          if (method == 'projects.list') {
+            if (failList) return Future.error(offline);
+            return Future.value(
+              _FakeGateway._ok({
+                'projects': [_projectJson(id: 'p1', name: 'Before')],
+                'active_id': null,
+              }),
+            );
+          }
+          if (method == 'projects.update') {
+            return Future.value(
+              _FakeGateway._ok({
+                'project': _projectJson(id: 'p1', name: 'After'),
+              }),
+            );
+          }
+          return Future.value(_FakeGateway._ok(const {}));
+        });
+        final repo = ProjectsRepository(
+          client: client,
+          preferences: preferences,
+          connectionId: 'gateway-a',
+        );
+        await repo.refresh();
+        final staleCache = preferences.getString('projects_cache_v1_gateway-a');
+        expect(staleCache, isNotNull);
+        await repo.rename('p1', 'After');
+        await preferences.setString('projects_cache_v1_gateway-a', staleCache!);
+
+        failList = true;
+        final fallback = await repo.refresh();
+
+        expect(fallback.projects.single.name, 'After');
+        expect(fallback.isStale, isTrue);
+        expect(fallback.error, same(offline));
+      },
+    );
+
+    test(
+      'a stale refresh cannot restore a project after delete succeeds',
+      () async {
+        final staleRefresh = Completer<Map<String, dynamic>>();
+        final deleteResponse = Completer<Map<String, dynamic>>();
+        var listCalls = 0;
+        final preferences = await SharedPreferences.getInstance();
+        final client = ProjectsGatewayClient((method, params) {
+          if (method == 'projects.list') {
+            listCalls++;
+            if (listCalls > 1) return staleRefresh.future;
+            return Future.value(
+              _FakeGateway._ok({
+                'projects': [_projectJson(id: 'p1', name: 'Old')],
+                'active_id': 'p1',
+              }),
+            );
+          }
+          if (method == 'projects.delete') return deleteResponse.future;
+          return Future.value(_FakeGateway._ok(const {}));
+        });
+        final repo = ProjectsRepository(
+          client: client,
+          preferences: preferences,
+          connectionId: 'gateway-a',
+        );
+        await repo.refresh();
+
+        final deletion = repo.delete('p1');
+        await Future<void>.delayed(Duration.zero);
+        final refresh = repo.refresh();
+        deleteResponse.complete(
+          _FakeGateway._ok({'projects': const [], 'active_id': null}),
+        );
+        await deletion;
+        staleRefresh.complete(
+          _FakeGateway._ok({
+            'projects': [_projectJson(id: 'p1', name: 'Old')],
+            'active_id': 'p1',
+          }),
+        );
+        await refresh;
+
+        expect(repo.current.projects, isEmpty);
+        expect(repo.current.activeId, isNull);
+        final restarted = ProjectsRepository(
+          client: client,
+          preferences: preferences,
+          connectionId: 'gateway-a',
+        );
+        expect((await restarted.loadCached()).projects, isEmpty);
+      },
+    );
+
+    test('a stale refresh cannot revert a completed rename', () async {
+      final staleRefresh = Completer<Map<String, dynamic>>();
+      final renameResponse = Completer<Map<String, dynamic>>();
+      var listCalls = 0;
+      final client = ProjectsGatewayClient((method, params) {
+        if (method == 'projects.list') {
+          listCalls++;
+          if (listCalls > 1) return staleRefresh.future;
+          return Future.value(
+            _FakeGateway._ok({
+              'projects': [_projectJson(id: 'p1', name: 'Before')],
+              'active_id': null,
+            }),
+          );
+        }
+        if (method == 'projects.update') return renameResponse.future;
+        return Future.value(_FakeGateway._ok(const {}));
+      });
+      final repo = ProjectsRepository(
+        client: client,
+        preferences: await SharedPreferences.getInstance(),
+        connectionId: 'gateway-a',
+      );
+      await repo.refresh();
+
+      final rename = repo.rename('p1', 'After');
+      await Future<void>.delayed(Duration.zero);
+      final refresh = repo.refresh();
+      renameResponse.complete(
+        _FakeGateway._ok({'project': _projectJson(id: 'p1', name: 'After')}),
+      );
+      await rename;
+      staleRefresh.complete(
+        _FakeGateway._ok({
+          'projects': [_projectJson(id: 'p1', name: 'Before')],
+          'active_id': null,
+        }),
+      );
+      await refresh;
+
+      expect(repo.current.projects.single.name, 'After');
+    });
+
+    test(
+      'a closed repository cannot overwrite a newer repository cache',
+      () async {
+        final staleRefresh = Completer<Map<String, dynamic>>();
+        final preferences = await SharedPreferences.getInstance();
+        final staleClient = ProjectsGatewayClient(
+          (method, params) => staleRefresh.future,
+        );
+        final staleRepo = ProjectsRepository(
+          client: staleClient,
+          preferences: preferences,
+          connectionId: 'gateway-a',
+        );
+        final staleResult = staleRepo.refresh();
+        await staleRepo.close();
+
+        final freshClient = ProjectsGatewayClient(
+          (method, params) => Future.value(
+            _FakeGateway._ok({
+              'projects': [_projectJson(id: 'new', name: 'After')],
+              'active_id': null,
+            }),
+          ),
+        );
+        final freshRepo = ProjectsRepository(
+          client: freshClient,
+          preferences: preferences,
+          connectionId: 'gateway-a',
+        );
+        await freshRepo.refresh();
+        staleRefresh.complete(
+          _FakeGateway._ok({
+            'projects': [_projectJson(id: 'old', name: 'Before')],
+            'active_id': null,
+          }),
+        );
+        await staleResult;
+
+        final restarted = ProjectsRepository(
+          client: freshClient,
+          preferences: preferences,
+          connectionId: 'gateway-a',
+        );
+        expect(
+          (await restarted.loadCached()).projects.map((project) => project.id),
+          ['new'],
+        );
+      },
+    );
+
+    test('a newer delete waits for a failed archive rollback', () async {
+      final archiveResponse = Completer<Map<String, dynamic>>();
+      final deleteResponse = Completer<Map<String, dynamic>>();
+      var archiveCalls = 0;
+      var deleteCalls = 0;
+      final client = ProjectsGatewayClient((method, params) {
+        switch (method) {
+          case 'projects.list':
+            return Future.value(
+              _FakeGateway._ok({
+                'projects': [_projectJson(id: 'old', name: 'Old')],
+                'active_id': null,
+              }),
+            );
+          case 'projects.archive':
+            archiveCalls++;
+            return archiveResponse.future;
+          case 'projects.delete':
+            deleteCalls++;
+            return deleteResponse.future;
+          default:
+            return Future.value(_FakeGateway._ok(const {}));
+        }
+      });
+      final repo = ProjectsRepository(
+        client: client,
+        preferences: await SharedPreferences.getInstance(),
+        connectionId: 'gateway-a',
+      );
+      await repo.refresh();
+
+      final archive = repo.archive('old');
+      final delete = repo.delete('old');
+      await Future<void>.delayed(Duration.zero);
+      expect(archiveCalls, 1);
+      expect(deleteCalls, 0);
+      archiveResponse.completeError(_offline);
+      await expectLater(archive, throwsA(isA<JsonRpcError>()));
+      await Future<void>.delayed(Duration.zero);
+      expect(deleteCalls, 1);
+      deleteResponse.complete(
+        _FakeGateway._ok({'projects': const [], 'active_id': null}),
+      );
+      await delete;
+
+      expect(repo.current.projects, isEmpty);
+      expect(repo.current.archived, isEmpty);
+    });
+
     test('a failed create rolls back to the previous list', () async {
       final gateway = _FakeGateway(
         projects: [_projectJson(id: 'p1', name: 'Kept')],
