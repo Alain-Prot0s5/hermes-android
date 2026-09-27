@@ -6,6 +6,7 @@
 // once per page. This test drives both session-list loaders (the
 // standalone SessionListScreen and Home's loader in WorkspaceScreen)
 // against a fake that reproduces the stock paging semantics.
+import 'dart:async';
 import 'dart:convert';
 
 import 'package:flutter/material.dart';
@@ -113,10 +114,7 @@ class _PinnedBackfillClient extends http.BaseClient {
       final limit = int.tryParse(uri.queryParameters['limit'] ?? '') ?? 50;
       final windowRows = [
         for (var i = offset; i < offset + limit && i < totalWindow; i++)
-          if (_isPinnedWindowIndex(i))
-            _pinnedRow('w$i')
-          else
-            _windowRow(i),
+          if (_isPinnedWindowIndex(i)) _pinnedRow('w$i') else _windowRow(i),
       ];
       // Back-fill: stock appends EVERY pinned row the window missed
       // (external pins AND pinned window rows outside the current
@@ -129,8 +127,9 @@ class _PinnedBackfillClient extends http.BaseClient {
       ];
       final seenBackfill = <String>{};
       final backfill = allPinned
-          .where((r) =>
-              !windowIds.contains(r['id']) && seenBackfill.add(r['id']!))
+          .where(
+            (r) => !windowIds.contains(r['id']) && seenBackfill.add(r['id']!),
+          )
           .toList();
       // Pins lead the payload so they always render in the viewport; the
       // stock gateway repeats them on every page.
@@ -148,6 +147,75 @@ class _PinnedBackfillClient extends http.BaseClient {
       });
     }
     return _json({'error': 'unexpected request ${uri.path}'}, status: 404);
+  }
+}
+
+Map<String, dynamic> _namedRow(
+  String id,
+  String title, {
+  bool pinned = false,
+}) => {
+  'id': id,
+  'title': title,
+  'model': 'gpt-oss-20b',
+  'source': 'gateway',
+  'message_count': 2,
+  'preview': title,
+  'started_at': _now,
+  'last_active': _now,
+  if (pinned) 'pinned': true,
+};
+
+/// Deterministic refresh/load-more race: the first offset-2 page belongs to
+/// the old generation and carries enough pins to corrupt the refreshed
+/// exhaustion bound if it resumes after its paused preferences read.
+class _StaleGenerationClient extends http.BaseClient {
+  final List<String> requestedOffsets = [];
+  int _zeroOffsetRequests = 0;
+  int _offsetTwoRequests = 0;
+
+  http.StreamedResponse _json(Map<String, dynamic> body) =>
+      http.StreamedResponse(
+        Stream.value(utf8.encode(jsonEncode(body))),
+        200,
+        headers: {'content-type': 'application/json'},
+      );
+
+  @override
+  Future<http.StreamedResponse> send(http.BaseRequest request) async {
+    if (!request.url.path.endsWith('/api/sessions')) {
+      return _json({'status': 'ok'});
+    }
+    final offsetParam = request.url.queryParameters['offset'];
+    if (offsetParam == null) {
+      return _json({'object': 'list', 'data': [], 'has_more': false});
+    }
+    requestedOffsets.add(offsetParam);
+    final offset = int.parse(offsetParam);
+    List<Map<String, dynamic>> rows;
+    if (offset == 0) {
+      _zeroOffsetRequests += 1;
+      rows = _zeroOffsetRequests == 1
+          ? [_namedRow('old-a', 'Old A'), _namedRow('old-b', 'Old B')]
+          : [_namedRow('fresh-a', 'Fresh A'), _namedRow('fresh-b', 'Fresh B')];
+    } else if (offset == 2) {
+      _offsetTwoRequests += 1;
+      rows = _offsetTwoRequests == 1
+          ? [
+              for (var i = 0; i < 6; i += 1)
+                _namedRow('stale-pin-$i', 'Stale pin $i', pinned: true),
+            ]
+          : [];
+    } else {
+      rows = [];
+    }
+    return _json({
+      'object': 'list',
+      'data': rows,
+      'limit': 2,
+      'offset': offset,
+      'has_more': rows.isNotEmpty,
+    });
   }
 }
 
@@ -219,7 +287,8 @@ void main() {
       expect(
         fake.requestedOffsets.every((o) => int.parse(o) % 50 == 0),
         isTrue,
-        reason: 'offsets must advance by the requested window, never by '
+        reason:
+            'offsets must advance by the requested window, never by '
             'the returned row count',
       );
 
@@ -315,10 +384,8 @@ void main() {
       },
     );
 
-    testWidgets(
-      'a pin inside a later page (has_more=false too early) does not '
-      'stop pagination',
-      (tester) async {
+    testWidgets('a pin inside a later page (has_more=false too early) does not '
+        'stop pagination', (tester) async {
         // Window row 55 is pinned. Page 50 therefore reports
         // has_more=false even though rows 100-119 still exist.
         final fake = _PinnedBackfillClient(
@@ -372,12 +439,11 @@ void main() {
         );
         await tester.pumpAndSettle();
         expect(find.text('Window chat 119'), findsOneWidget);
-      },
-    );
+    });
 
     testWidgets(
-      'a pin-ONLY base window does not stop pagination or prune against '
-      'the partial set (reviewer reproduction)',
+      'a pin-ONLY base window does not stop pagination or delete assignments '
+      '(reviewer reproduction)',
       (tester) async {
         // The reviewer's exact stock-SessionDB reproduction, at page size
         // 2: offset 0 -> s0,s1 (+ pins back-filled); offset 2 -> ONLY the
@@ -392,15 +458,19 @@ void main() {
             [2, 3],
           ],
         );
-        // w4 is filed into a space; a stale 'gone' assignment must still
-        // be pruned once the FULL list is proven loaded.
+        // w4 is filed into a space. An assignment absent from this live
+        // OFFSET scan must remain too: paging has no stable snapshot token,
+        // so absence is not authoritative deletion evidence.
         final prefs = await SharedPreferences.getInstance();
-        prefs.setString('chat_spaces_v1_paging-pinonly', jsonEncode({
+        prefs.setString(
+          'chat_spaces_v1_paging-pinonly',
+          jsonEncode({
           'spaces': [
             {'id': 'sp1', 'name': 'Work', 'created_at': 1},
           ],
           'assignments': {'w4': 'sp1', 'gone': 'sp1'},
-        }));
+          }),
+        );
         final controller = GatewayTurnApplicationController(
           sessionFactory: (_) => InertTurnApplicationSession(),
         );
@@ -448,19 +518,99 @@ void main() {
         await tester.pumpAndSettle();
         expect(find.text('Window chat 5'), findsOneWidget);
 
-        // Pruning ran only against the PROVEN-complete set: w4's space
-        // assignment survived, the stale 'gone' assignment was pruned.
-        final stored = jsonDecode(
-          prefs.getString('chat_spaces_v1_paging-pinonly')!,
-        ) as Map<String, dynamic>;
+        // Both assignments survive. Explicit session deletion removes its
+        // own assignment, but an exhausted live OFFSET scan cannot safely do
+        // so because activity may move a row into an already-scanned prefix.
+        final stored =
+            jsonDecode(prefs.getString('chat_spaces_v1_paging-pinonly')!)
+                as Map<String, dynamic>;
         final assignments = Map<String, dynamic>.from(
           stored['assignments'] as Map,
         );
-        expect(assignments['w4'], 'sp1', reason:
-            'prune must not run against a partial (pin-only-window '
-            'truncated) raw-id set');
-        expect(assignments.containsKey('gone'), isFalse, reason:
-            'prune must still run once completion is proven');
+        expect(assignments['w4'], 'sp1');
+        expect(
+          assignments['gone'],
+          'sp1',
+          reason: 'OFFSET scan absence is not deletion evidence',
+        );
+      },
+    );
+    testWidgets(
+      'a stale load-more paused in preferences cannot mutate refreshed '
+      'exhaustion state',
+      (tester) async {
+        final fake = _StaleGenerationClient();
+        final prefs = await SharedPreferences.getInstance();
+        final stalePreferences = Completer<SharedPreferences>();
+        final stalePreferencesRequested = Completer<void>();
+        var preferenceReads = 0;
+        Future<SharedPreferences> loadPreferences() {
+          preferenceReads += 1;
+          if (preferenceReads == 2) {
+            stalePreferencesRequested.complete();
+            return stalePreferences.future;
+          }
+          return Future.value(prefs);
+        }
+
+        final controller = GatewayTurnApplicationController(
+          sessionFactory: (_) => InertTurnApplicationSession(),
+        );
+        addTearDown(controller.close);
+        tester.view.physicalSize = const Size(500, 600);
+        tester.view.devicePixelRatio = 1.0;
+        addTearDown(tester.view.reset);
+
+        await tester.pumpWidget(
+          MaterialApp(
+            home: SessionListScreen(
+              connection: _connection('paging-generation'),
+              turnApplicationController: controller,
+              testHttpClient: fake,
+              testSessionPageSize: 2,
+              testPreferencesLoader: loadPreferences,
+            ),
+          ),
+        );
+        await tester.pumpAndSettle();
+
+        final list = find.descendant(
+          of: find.byType(RefreshIndicator),
+          matching: find.byType(ListView),
+        );
+        await tester.drag(list, const Offset(0, -1200));
+        await tester.pump();
+        await stalePreferencesRequested.future;
+        expect(fake.requestedOffsets, ['0', '2']);
+
+        // Refresh while the old offset-2 continuation is suspended inside
+        // its preferences await. The refreshed generation must own all
+        // accumulator and loading flags from this point onward.
+        unawaited(
+          tester
+              .state<RefreshIndicatorState>(find.byType(RefreshIndicator))
+              .show(),
+        );
+        await tester.pump();
+        await tester.pump(const Duration(seconds: 1));
+        expect(fake.requestedOffsets, ['0', '2', '0']);
+        expect(find.text('Fresh A'), findsWidgets);
+        expect(find.text('Old A'), findsNothing);
+
+        stalePreferences.complete(prefs);
+        await tester.pump();
+        await tester.pumpAndSettle();
+        expect(find.text('Stale pin 0'), findsNothing);
+
+        // One empty offset-2 page is terminal for the refreshed no-pin scan.
+        // If the stale page inflated _seenPinCount, the screen would request
+        // offset 4 and beyond instead.
+        await tester.drag(list, const Offset(0, -1200));
+        await tester.pumpAndSettle();
+        expect(fake.requestedOffsets, ['0', '2', '0', '2']);
+        await tester.drag(list, const Offset(0, -1200));
+        await tester.pumpAndSettle();
+        expect(fake.requestedOffsets, ['0', '2', '0', '2']);
       },
     );
   });
@@ -531,7 +681,8 @@ void main() {
       expect(
         fake.requestedOffsets.every((o) => int.parse(o) % 100 == 0),
         isTrue,
-        reason: 'offsets must advance by the requested window, never by '
+        reason:
+            'offsets must advance by the requested window, never by '
             'the returned row count',
       );
 
@@ -665,14 +816,20 @@ void main() {
           ),
         );
         await tester.scrollUntilVisible(
-          find.descendant(of: chatsScope, matching: find.text('Window chat 119')),
+          find.descendant(
+            of: chatsScope,
+            matching: find.text('Window chat 119'),
+          ),
           400,
           scrollable: chatsScrollable,
           maxScrolls: 80,
         );
         await tester.pumpAndSettle();
         expect(
-          find.descendant(of: chatsScope, matching: find.text('Window chat 119')),
+          find.descendant(
+            of: chatsScope,
+            matching: find.text('Window chat 119'),
+          ),
           findsOneWidget,
         );
       },

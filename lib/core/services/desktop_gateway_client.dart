@@ -61,6 +61,13 @@ class DesktopGatewayClient {
     'subagent.tool',
     'subagent.progress',
     'subagent.complete',
+    // A detached legacy turn can settle after its prompt.submit listener was
+    // rejected by socket close. Route its terminal frame to ChatScreen's
+    // recovery controller; live turns ignore this duplicate async delivery.
+    'message.complete',
+    'turn.end',
+    'turn.error',
+    'error',
   };
 
   DesktopGatewayClient._({
@@ -204,8 +211,11 @@ class DesktopGatewayClient {
   }) {
     final inFlight = _bindingInFlight[mobileSessionId];
     if (inFlight != null) return inFlight;
-    final future = _resumeOrCreate(client, mobileSessionId,
-        workingDirectory: workingDirectory);
+    final future = _resumeOrCreate(
+      client,
+      mobileSessionId,
+      workingDirectory: workingDirectory,
+    );
     _bindingInFlight[mobileSessionId] = future;
     future.whenComplete(() {
       if (identical(_bindingInFlight[mobileSessionId], future)) {
@@ -368,10 +378,11 @@ class DesktopGatewayClient {
     final storedSessionId =
         _storedSessionIds[mobileSessionId] ?? mobileSessionId;
     try {
-      final runtimeSessionId = await client.resumeSession(storedSessionId);
+      final resumed = await client.resumeSessionDetails(storedSessionId);
       return _DesktopGatewayBinding(
-        runtimeSessionId: runtimeSessionId,
+        runtimeSessionId: resumed.runtimeSessionId,
         storedSessionId: storedSessionId,
+        resumed: resumed,
       );
     } on JsonRpcError catch (error) {
       if (error.code != 4007 &&
@@ -397,6 +408,43 @@ class DesktopGatewayClient {
   ) {
     _gatewaySessionIds[mobileSessionId] = binding.runtimeSessionId;
     _storedSessionIds[mobileSessionId] = binding.storedSessionId;
+    final resumed = binding.resumed;
+    final inflight = resumed?.inflight;
+    final error = inflight?['error']?.toString().trim() ?? '';
+    final status = (inflight?['status'] ?? resumed?.status)
+        ?.toString()
+        .trim()
+        .toLowerCase();
+    const terminalFailures = {
+      'error',
+      'failed',
+      'interrupted',
+      'cancelled',
+      'canceled',
+    };
+    if (resumed != null &&
+        (error.isNotEmpty || terminalFailures.contains(status))) {
+      if (binding.resumeStateDelivered) return;
+      binding.resumeStateDelivered = true;
+      // Deliver after the binding maps are authoritative. The UI may already
+      // have begun a history fetch from the connected callback; its recovery
+      // generation makes that fetch harmless once this failure clears it.
+      scheduleMicrotask(() {
+        _asyncEventListener?.call(
+          mobileSessionId,
+          StreamEvent(
+            type: 'turn.error',
+            data: {
+              'session_id': binding.runtimeSessionId,
+              'message': error.isNotEmpty ? error : 'Detached turn $status',
+              if (status != null && status.isNotEmpty) 'status': status,
+            },
+            isComplete: true,
+            sessionId: binding.runtimeSessionId,
+          ),
+        );
+      });
+    }
   }
 
   /// The gateway's stored session key bound to a mobile session id, when a
@@ -438,10 +486,9 @@ class DesktopGatewayClient {
     } on JsonRpcError catch (error) {
       if (!_isStaleRuntimeSession(error)) rethrow;
       final client = _ws;
-      if (client == null || !client.isConnected || !_rememberedRuntimeIsStale(
-            mobileSessionId,
-            session.sessionId,
-          )) {
+      if (client == null ||
+          !client.isConnected ||
+          !_rememberedRuntimeIsStale(mobileSessionId, session.sessionId)) {
         rethrow;
       }
       _gatewaySessionIds.remove(mobileSessionId);
@@ -459,8 +506,10 @@ class DesktopGatewayClient {
   /// some other path already re-bound the session while the call was in
   /// flight, the error came from a different generation and a blind retry
   /// could double-execute against the new binding.
-  bool _rememberedRuntimeIsStale(String mobileSessionId, String usedRuntimeId) =>
-      _gatewaySessionIds[mobileSessionId] == usedRuntimeId;
+  bool _rememberedRuntimeIsStale(
+    String mobileSessionId,
+    String usedRuntimeId,
+  ) => _gatewaySessionIds[mobileSessionId] == usedRuntimeId;
 
   Future<void> ensureSession(
     String sessionId, {
@@ -549,9 +598,12 @@ class DesktopGatewayClient {
     );
   }
 
-  /// Receives only durable, session-scoped events that may arrive after a
-  /// prompt's terminal event. Active-turn events continue through [submitPrompt]
-  /// so they are never delivered twice.
+  /// Receives durable session-scoped events plus terminal turn frames.
+  ///
+  /// Terminal frames are also delivered through [submitPrompt] while its
+  /// listener is attached. The async path is required after socket close,
+  /// when a detached turn can settle on the resumed session; ChatScreen
+  /// ignores the duplicate unless legacy reattach recovery is pending.
   void setAsyncEventListener(DesktopAsyncEventCallback? listener) {
     _asyncEventListener = listener;
   }
@@ -752,9 +804,12 @@ class _DesktopGatewaySession {
 class _DesktopGatewayBinding {
   final String runtimeSessionId;
   final String storedSessionId;
+  final ResumedGatewaySession? resumed;
+  bool resumeStateDelivered = false;
 
-  const _DesktopGatewayBinding({
+  _DesktopGatewayBinding({
     required this.runtimeSessionId,
     required this.storedSessionId,
+    this.resumed,
   });
 }

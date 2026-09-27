@@ -67,11 +67,17 @@ class SessionListScreen extends StatefulWidget {
   /// shipping 50+ fixtures. Production keeps the 50-row window.
   final int? testSessionPageSize;
 
+  /// Test-only seam for pausing a preferences read across a refresh. This
+  /// makes stale-generation races deterministic without changing production
+  /// persistence behaviour.
+  final Future<SharedPreferences> Function()? testPreferencesLoader;
+
   const SessionListScreen({
     required this.connection,
     required this.turnApplicationController,
     this.testHttpClient,
     this.testSessionPageSize,
+    this.testPreferencesLoader,
     super.key,
   });
 
@@ -107,16 +113,14 @@ class _SessionListScreenState extends State<SessionListScreen> {
   bool _loadingMoreSessions = false;
 
   /// Raw session ids from every loaded page, before any source filtering.
-  /// Space-assignment pruning must run against this set, never against the
-  /// filtered list — an excluded-source session from an earlier page is
-  /// still alive, and pruning against the filtered set would wipe its
-  /// assignment as if the session had been deleted.
+  /// This drives page deduplication and scan-exhaustion detection only. The
+  /// live OFFSET scan is not a deletion-safe snapshot: activity can reorder a
+  /// session into an already-scanned prefix between requests.
   final Set<String> _rawLoadedIds = {};
 
-  /// Bumped by every full refresh ([_fetchSessions]). Load-more requests
-  /// capture it and discard their page (including any prune) when a refresh
-  /// started while they were in flight — a stale page must never append to,
-  /// or worse prune against, the accumulator a refresh just cleared.
+  /// Bumped by every full refresh ([_fetchSessions]). Every async continuation
+  /// captures it and discards stale results before mutating the accumulator or
+  /// UI state a newer refresh owns.
   int _sessionsGeneration = 0;
 
   /// Consecutive pages (across refresh + load-more) that contributed zero
@@ -130,15 +134,18 @@ class _SessionListScreenState extends State<SessionListScreen> {
   /// page's pinned count already bounds the whole pin set.
   int _seenPinCount = 0;
 
-  /// Consecutive zero-new-ids pages that PROVE end-of-list. Proof:
+  /// Consecutive zero-new-ids pages that prove this best-effort OFFSET scan is
+  /// exhausted. This is not proof of a deletion-complete snapshot: activity
+  /// can reorder rows between requests, so absence must never delete local
+  /// metadata. For stopping pagination, the stock pin contract gives us:
   /// a non-pinned row appears only in its own LIMIT/OFFSET window
   /// (windows are disjoint, pins are the only repeats), so a mid-store
   /// window with zero unseen ids must consist ENTIRELY of pins — and each
   /// such window consumes pageSize DISTINCT pins. k consecutive zero-new
   /// windows therefore require k*pageSize pins to exist. Once k exceeds
   /// pinCount ~/ pageSize, the newest zero-new window cannot be mid-store:
-  /// it is past the end, every earlier window's rows are all seen (new
-  /// non-pins or repeated pins), and the list is provably complete.
+  /// it is past the end under the stock pin-window contract, so this scan can
+  /// stop without claiming that its mutable pages form a deletion snapshot.
   /// With no pins at all, one zero-new page already proves it (a full
   /// all-pin window cannot exist when pinCount < pageSize).
   /// The bound is exact because EVERY stock response carries EVERY pin
@@ -699,21 +706,23 @@ class _SessionListScreenState extends State<SessionListScreen> {
   }
 
   Future<void> _fetchSessions() async {
+    final generation = ++_sessionsGeneration;
     setState(() {
       _loading = true;
+      _loadingMoreSessions = false;
       _error = null;
     });
-    // Full refresh: the raw-id accumulator restarts here. Carrying stale
-    // ids across refreshes would keep a deleted session in the "live"
-    // prune set forever, so its space assignment could never be pruned.
+    // Full refresh: the paging accumulator belongs only to this generation.
     _rawLoadedIds.clear();
-    _sessionsGeneration++;
     _zeroNewIdPages = 0;
     _seenPinCount = 0;
     try {
       final page = await _client.getSessionsPage(limit: _sessionPageSize);
-      if (!mounted) return;
-      final prefs = await SharedPreferences.getInstance();
+      if (!mounted || generation != _sessionsGeneration) return;
+      final prefs =
+          await (widget.testPreferencesLoader?.call() ??
+              SharedPreferences.getInstance());
+      if (!mounted || generation != _sessionsGeneration) return;
       final key = 'excluded_session_sources_${widget.connection.id}';
       final excluded = prefs.getStringList(key) ?? [];
       final filtered = page.sessions
@@ -722,14 +731,7 @@ class _SessionListScreenState extends State<SessionListScreen> {
       final store =
           _spaceStore ??
           ChatSpaceStore(prefs, connectionId: widget.connection.id);
-      // Pruning removes assignments for sessions that no longer exist. It
-      // must only run against a COMPLETE list: with paging, pruning on page
-      // one alone would wipe the space assignments of every session still
-      // on an unfetched page. The set is the RAW ids of every loaded page —
-      // excluded-source sessions are alive too, and pruning against the
-      // filtered list would wipe their assignments as if deleted.
-      //
-      // Completeness is decided client-side, never by `has_more`: the stock
+      // Scan exhaustion is decided client-side, never by `has_more`: the stock
       // gateway computes it from the non-pinned rows in the combined
       // response (api_server.py: windowed >= limit), so any window holding
       // a pin can report has_more=false while rows still exist past the
@@ -737,17 +739,14 @@ class _SessionListScreenState extends State<SessionListScreen> {
       // include_pinned repeats EVERY pin on EVERY page, so a later base
       // window made entirely of already-seen pins contributes no new ids
       // even while unseen non-pinned rows remain further along. The
-      // provable rule lives in _requiredZeroNewPages: k consecutive
+      // stopping rule lives in _requiredZeroNewPages: k consecutive
       // zero-new windows must consist entirely of pins, windows are
       // disjoint, so k * pageSize pins exist — once that exceeds the pin
-      // bound observed on the pages, the end is proven.
+      // bound observed on the pages, this scan is exhausted.
       _notePageForExhaustion(page.sessions);
-      final provenComplete = _isListProvenComplete;
-      if (provenComplete) {
-        await store.pruneAssignments(Set.of(_rawLoadedIds));
-      }
+      final scanExhausted = _isScanExhausted;
       final spaceState = await store.load();
-      if (!mounted) return;
+      if (!mounted || generation != _sessionsGeneration) return;
       setState(() {
         _spaceStore = store;
         _spaceState = spaceState;
@@ -758,11 +757,11 @@ class _SessionListScreenState extends State<SessionListScreen> {
         // sessions.length would skip the gap between the window and the
         // back-fill on the next request.
         _sessionsOffset = _sessionPageSize;
-        _hasMoreSessions = !provenComplete;
+        _hasMoreSessions = !scanExhausted;
         _loading = false;
       });
     } catch (e) {
-      if (!mounted) return;
+      if (!mounted || generation != _sessionsGeneration) return;
       setState(() {
         _error = e.toString();
         _loading = false;
@@ -780,9 +779,7 @@ class _SessionListScreenState extends State<SessionListScreen> {
     // back-fill, deduped), so any single page's pinned count already
     // bounds the total pin set; take the max to stay safe against pages
     // fetched across a pin/unpin race.
-    final pinsOnPage = pageSessions
-        .where((session) => session.pinned)
-        .length;
+    final pinsOnPage = pageSessions.where((session) => session.pinned).length;
     if (pinsOnPage > _seenPinCount) _seenPinCount = pinsOnPage;
     if (newIds.isEmpty) {
       _zeroNewIdPages++;
@@ -791,7 +788,7 @@ class _SessionListScreenState extends State<SessionListScreen> {
     }
   }
 
-  bool get _isListProvenComplete =>
+  bool get _isScanExhausted =>
       _zeroNewIdPages >= _requiredZeroNewPages(_seenPinCount, _sessionPageSize);
 
   /// Append the next page of sessions when the list is scrolled near bottom.
@@ -804,49 +801,30 @@ class _SessionListScreenState extends State<SessionListScreen> {
         limit: _sessionPageSize,
         offset: _sessionsOffset,
       );
-      if (!mounted) return;
-      // A full refresh started while this page was in flight: it cleared
-      // the raw-id accumulator and restarted paging. Discard this stale
-      // page entirely — appending its rows would double-list them and,
-      // worse, its exhaustion bookkeeping could prune assignments against
-      // the half-cleared accumulator.
-      if (generation != _sessionsGeneration) {
-        setState(() => _loadingMoreSessions = false);
-        return;
-      }
-      final prefs = await SharedPreferences.getInstance();
+      if (!mounted || generation != _sessionsGeneration) return;
+      final prefs =
+          await (widget.testPreferencesLoader?.call() ??
+              SharedPreferences.getInstance());
+      // SharedPreferences may suspend long enough for a full refresh to
+      // replace this generation. Recheck before touching paging state.
+      if (!mounted || generation != _sessionsGeneration) return;
       final excluded =
-          prefs.getStringList('excluded_session_sources_${widget.connection.id}') ??
+          prefs.getStringList(
+            'excluded_session_sources_${widget.connection.id}',
+          ) ??
           [];
       final existing = _sessions.map((s) => s.id).toSet();
       final incoming = page.sessions
-          .where((s) => !excluded.contains(s.source) && !existing.contains(s.id))
+          .where(
+            (s) => !excluded.contains(s.source) && !existing.contains(s.id),
+          )
           .toList();
       // Same end-of-list rule as the initial page: a zero-new page only
-      // proves exhaustion once the consecutive-zero count passes the pin
+      // proves scan exhaustion once the consecutive-zero count passes the pin
       // bound (see _fetchSessions). Until then keep paging — a pin-only
       // window is not the end.
       _notePageForExhaustion(page.sessions);
-      final provenComplete = _isListProvenComplete;
-      if (provenComplete) {
-        // Full list now loaded — safe to reconcile space assignments,
-        // against the RAW ids of every page (see _fetchSessions: the
-        // filtered set would prune live excluded-source sessions).
-        await _spaceStore?.pruneAssignments(Set.of(_rawLoadedIds));
-        if (mounted && generation == _sessionsGeneration) {
-          final reconciled = await _spaceStore?.load();
-          if (mounted && reconciled != null) {
-            setState(() => _spaceState = reconciled);
-          }
-        }
-      }
-      if (!mounted) return;
-      if (generation != _sessionsGeneration) {
-        // A refresh landed while the prune was awaited; it owns the list
-        // state now. Drop this page's append.
-        setState(() => _loadingMoreSessions = false);
-        return;
-      }
+      final scanExhausted = _isScanExhausted;
       setState(() {
         _sessions = [..._sessions, ...incoming];
         // Advance by the requested window, never the returned row count:
@@ -854,11 +832,11 @@ class _SessionListScreenState extends State<SessionListScreen> {
         // the offset past unfetched window rows (dedup below keeps the
         // repeated pins from showing twice).
         _sessionsOffset += _sessionPageSize;
-        _hasMoreSessions = !provenComplete;
+        _hasMoreSessions = !scanExhausted;
         _loadingMoreSessions = false;
       });
     } catch (e) {
-      if (!mounted) return;
+      if (!mounted || generation != _sessionsGeneration) return;
       // Keep the loaded pages; surface the failure and allow a retry on the
       // next scroll instead of losing the list.
       setState(() => _loadingMoreSessions = false);
@@ -1257,7 +1235,9 @@ class _SessionListScreenState extends State<SessionListScreen> {
         child: ListView.builder(
           padding: const EdgeInsets.all(16),
           itemCount:
-              visibleSessions.length + 1 + (_hasMoreSessions || _loadingMoreSessions ? 1 : 0),
+              visibleSessions.length +
+              1 +
+              (_hasMoreSessions || _loadingMoreSessions ? 1 : 0),
           itemBuilder: (context, index) {
             if (index == visibleSessions.length + 1) {
               return Padding(
@@ -1295,7 +1275,9 @@ class _SessionListScreenState extends State<SessionListScreen> {
                             padding: EdgeInsets.all(12),
                             child: SizedBox.square(
                               dimension: 18,
-                              child: CircularProgressIndicator(strokeWidth: 2),
+                                child: CircularProgressIndicator(
+                                  strokeWidth: 2,
+                                ),
                             ),
                           )
                         : const Icon(Icons.search),
@@ -1483,7 +1465,9 @@ class _SessionListScreenState extends State<SessionListScreen> {
               enabled: !isDeleting && !isBranching,
               leading: Icon(
                 session.isActive ? Icons.chat : Icons.chat_bubble_outline,
-                color: session.isActive ? const Color(0xFFD4AF37) : Colors.grey,
+                  color: session.isActive
+                      ? const Color(0xFFD4AF37)
+                      : Colors.grey,
               ),
               trailing: isDeleting || isBranching
                   ? const SizedBox(
@@ -1554,9 +1538,9 @@ class _SessionListScreenState extends State<SessionListScreen> {
                       session.preview,
                       maxLines: 2,
                       overflow: TextOverflow.ellipsis,
-                      style: Theme.of(
-                        context,
-                      ).textTheme.bodySmall?.copyWith(color: Colors.grey[500]),
+                        style: Theme.of(context).textTheme.bodySmall?.copyWith(
+                          color: Colors.grey[500],
+                        ),
                     ),
                 ],
               ),

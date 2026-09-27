@@ -1,24 +1,32 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <!-- Mutation gate for the PR #106 completion rules: whitelisted line
-     ranges only — end-of-list proofs, prune safety, generation discard,
-     resync watermark, retry budget. A surviving mutant here means a
+     ranges only — best-effort paging exhaustion, stale-generation discard,
+     durable reattach watermarks, persistent retry scheduling, and retained
+     terminal-failure handling. A surviving mutant here means a
      reviewer-visible blocker class hides behind green CI. -->
 <mutations version="1.2">
   <files>
     <file>lib/core/screens/session_list_screen.dart
-      <lines begin="149" end="152"/>
-      <lines begin="780" end="796"/>
-      <lines begin="805" end="850"/>
+      <lines begin="157" end="158"/>
+      <lines begin="708" end="792"/>
+      <lines begin="795" end="846"/>
     </file>
     <file>lib/core/screens/workspace_screen.dart
-      <lines begin="325" end="340"/>
+      <lines begin="330" end="337"/>
     </file>
     <file>lib/core/services/connection_manager.dart
-      <lines begin="1488" end="1515"/>
+      <lines begin="1535" end="1579"/>
     </file>
     <file>lib/core/screens/chat_screen.dart
-      <lines begin="876" end="908"/>
-      <lines begin="922" end="938"/>
+      <lines begin="920" end="971"/>
+      <lines begin="974" end="1086"/>
+      <lines begin="2580" end="2634"/>
+    </file>
+    <file>lib/core/services/desktop_gateway_client.dart
+      <lines begin="411" end="447"/>
+    </file>
+    <file>lib/core/services/ws_client.dart
+      <lines begin="943" end="979"/>
     </file>
   </files>
   <commands>

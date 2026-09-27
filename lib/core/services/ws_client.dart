@@ -159,6 +159,25 @@ class CreatedGatewaySession {
   });
 }
 
+/// Runtime binding and recovery state returned by `session.resume`.
+///
+/// Stock Hermes includes retained in-flight failure details here so a client
+/// that missed the terminal event while disconnected can stop recovery and
+/// surface the failure instead of polling history forever.
+class ResumedGatewaySession {
+  final String runtimeSessionId;
+  final bool? running;
+  final String? status;
+  final Map<String, dynamic>? inflight;
+
+  const ResumedGatewaySession({
+    required this.runtimeSessionId,
+    this.running,
+    this.status,
+    this.inflight,
+  });
+}
+
 typedef StreamCallback = void Function(StreamEvent event);
 typedef ConnectionCallback = void Function(bool connected);
 typedef GatewayReadyCallback = void Function(Map<String, dynamic> frame);
@@ -378,8 +397,7 @@ class WsClient {
     _lastLivenessMs = DateTime.now().millisecondsSinceEpoch;
     _heartbeatTimer = Timer.periodic(heartbeatInterval, (_) {
       if (generation != _connectionGeneration || !_connected) return;
-      final silenceMs =
-          DateTime.now().millisecondsSinceEpoch - _lastLivenessMs;
+      final silenceMs = DateTime.now().millisecondsSinceEpoch - _lastLivenessMs;
       if (silenceMs >= heartbeatDeadline.inMilliseconds) {
         // Half-open socket (phone slept, NAT dropped the mapping, proxy
         // died): close it so the close path rejects pending calls and the
@@ -922,8 +940,8 @@ class WsClient {
     }
   }
 
-  /// Resume an existing session.
-  Future<String> resumeSession(String sessionId) async {
+  /// Resume an existing session while preserving retained turn state.
+  Future<ResumedGatewaySession> resumeSessionDetails(String sessionId) async {
     final result = await send('session.resume', {'session_id': sessionId});
     if (result['error'] != null) {
       throw _gatewayResponseError(
@@ -932,12 +950,33 @@ class WsClient {
         fallbackMessage: 'Unknown error',
       );
     }
-    return result['result']?['session_id'] as String? ??
-        (throw StateError(
+    final rawPayload = result['result'];
+    if (rawPayload is! Map) {
+      throw StateError('session.resume succeeded without a result payload.');
+    }
+    final payload = Map<String, dynamic>.from(rawPayload);
+    final runtimeSessionId = payload['session_id'] as String?;
+    if (runtimeSessionId == null || runtimeSessionId.isEmpty) {
+      throw StateError(
           'session.resume succeeded without a session_id — refusing to bind '
           'the caller-supplied id, which may not be the runtime session the '
           'gateway resumed.',
-        ));
+      );
+    }
+    final rawInflight = payload['inflight'];
+    return ResumedGatewaySession(
+      runtimeSessionId: runtimeSessionId,
+      running: payload['running'] as bool?,
+      status: payload['status']?.toString(),
+      inflight: rawInflight is Map
+          ? Map<String, dynamic>.from(rawInflight)
+          : null,
+    );
+  }
+
+  /// Backward-compatible runtime-id-only resume helper.
+  Future<String> resumeSession(String sessionId) async {
+    return (await resumeSessionDetails(sessionId)).runtimeSessionId;
   }
 
   Future<void> setSessionTitle(String sessionId, String title) async {
