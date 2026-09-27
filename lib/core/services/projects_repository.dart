@@ -198,12 +198,13 @@ class ProjectsRepository {
 
   /// Optional folder auto-provisioner for name-only creates.
   ///
-  /// When set, a Project created without any folder gets a freshly made
+  /// When set, a Project created without any folder gets a provisioned
   /// directory bound as its primary — the phone cannot pick folders the
   /// way Desktop does, and a folderless Project cannot hold chats on
-  /// gateways without direct assignment. The provisioner never adopts a
-  /// pre-existing folder, so this can only ever bind a directory it just
-  /// created itself.
+  /// gateways without direct assignment. The provisioner chooses a fresh,
+  /// unguessable candidate and returns it only after verifying its independent
+  /// marker is uncontested. This provides practical collision resistance
+  /// without treating the host's non-atomic mkdir as proof of creation.
   final ProjectFolderProvisioner? folderProvisioner;
 
   final _controller = StreamController<ProjectsView>.broadcast();
@@ -322,7 +323,8 @@ class ProjectsRepository {
     try {
       created = await client.create(name: trimmed, use: select);
       if (created.folders.isEmpty && folderProvisioner != null) {
-        // Name-only create: give the Project a folder it owns outright.
+        // Name-only create: bind the fresh, unguessable candidate only after
+        // the provisioner verifies its independent marker is uncontested.
         // A provisioning or bind failure must not undo the create — the
         // Project exists and stays folderless (honest, and the user can
         // add a folder later); only the auto-home is lost.

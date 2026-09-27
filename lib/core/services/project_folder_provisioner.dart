@@ -26,9 +26,10 @@ import 'connection_manager.dart';
 /// name (any other client provisioning the same slug) can create the same
 /// EMPTY directory after our 404 probe, and our marker would then be the
 /// only entry in a folder we did not create. The candidate name therefore
-/// carries 64 bits of per-attempt randomness: no other actor can pre-create
-/// the exact path we are about to mkdir, so probe-404 + mkdir + marker is
-/// airtight. The marker (an unguessable `hermes-provision-<token>.owner`
+/// carries 64 bits of randomness: accidental or non-cooperating collision is
+/// extremely unlikely, although the non-atomic mkdir cannot prove which actor
+/// created the directory. The marker (an unguessable
+/// `hermes-provision-<token>.owner`
 /// written inside, read back with the directory listing showing it as the
 /// only entry) stays as defense-in-depth: it proves write access and
 /// rejects any folder that already carries someone else's contents. A
@@ -91,8 +92,8 @@ class DashboardFolderProvisioner implements ProjectFolderProvisioner {
     // One unguessable token per provision() call, folded into EVERY
     // candidate name. The probe→mkdir window cannot be closed by any
     // check (stock mkdir is exist_ok=True), so the name itself must be
-    // impossible for a concurrent actor to pre-create: seeing the request
-    // URL does not help, the token is 64 random bits. The -N suffix still
+    // impractical for an independent concurrent actor to pre-create: the token
+    // is 64 random bits. The -N suffix still
     // rotates on probe-present so a retried provision of the same slug
     // never reuses a name.
     final nonce = _ownerToken().substring(0, 16);
@@ -135,11 +136,9 @@ class DashboardFolderProvisioner implements ProjectFolderProvisioner {
       }
       // The stock mkdir is exist_ok=True: a 200 here does NOT prove we
       // created the directory. Claim it instead: write an unguessable
-      // marker inside and read it back. Only a folder this call owns
-      // (created by us, or at least writable exclusively enough to hold
-      // our secret token) can pass this check; a directory a concurrent
-      // creator made first will not contain our marker, and a folder we
-      // cannot even write into is not ours to adopt either.
+      // marker inside and read it back. Only a folder writable enough to hold
+      // our secret token and uncontested at verification can pass this check;
+      // a folder we cannot write into is not ours to adopt.
       if (await _claimOwnership(candidate)) {
         return candidate;
       }
@@ -155,8 +154,9 @@ class DashboardFolderProvisioner implements ProjectFolderProvisioner {
   /// who created the folder, and a marker that merely exists proves only
   /// that we can write here — two racing callers could each drop their own
   /// marker and both "verify". Requiring our marker to be the ONLY entry
-  /// makes adoption mutually exclusive: once a racer's marker also lands,
-  /// the directory shows two entries and neither caller adopts it.
+  /// rejects a claim once a racer's marker is visible. Combined with the
+  /// unguessable candidate path, this is practical collision resistance, not
+  /// an atomic ownership primitive.
   /// A failed write, a mismatched read, or a multi-entry listing means
   /// the candidate is abandoned — never adopted, never deleted (it may
   /// belong to the concurrent creator that won the mkdir race).
