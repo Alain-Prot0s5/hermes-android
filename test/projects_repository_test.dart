@@ -391,6 +391,61 @@ void main() {
       },
     );
 
+    test(
+      'a failed concurrent create never persists its pending placeholder',
+      () async {
+        final creates = <Completer<Map<String, dynamic>>>[];
+        final preferences = await SharedPreferences.getInstance();
+        final client = ProjectsGatewayClient((method, params) {
+          if (method == 'projects.list') {
+            return Future.value(
+              _FakeGateway._ok({
+                'projects': const <Map<String, dynamic>>[],
+                'active_id': null,
+              }),
+            );
+          }
+          if (method == 'projects.create') {
+            final response = Completer<Map<String, dynamic>>();
+            creates.add(response);
+            return response.future;
+          }
+          return Future.value(_FakeGateway._ok(const {}));
+        });
+        final repo = ProjectsRepository(
+          client: client,
+          preferences: preferences,
+          connectionId: 'gateway-a',
+        );
+        await repo.refresh();
+
+        final first = repo.create('First');
+        final second = repo.create('Second');
+        creates[0].complete(
+          _FakeGateway._ok({
+            'project': _projectJson(id: 'srv-1', name: 'First'),
+          }),
+        );
+        await first;
+        creates[1].completeError(
+          JsonRpcError('projects.create', 'second failed'),
+        );
+        await expectLater(second, throwsA(isA<JsonRpcError>()));
+
+        final restarted = ProjectsRepository(
+          client: client,
+          preferences: preferences,
+          connectionId: 'gateway-a',
+        );
+        final cached = await restarted.loadCached();
+        expect(cached.projects.map((project) => project.id), ['srv-1']);
+        expect(
+          cached.projects.where((project) => project.id.startsWith('pending:')),
+          isEmpty,
+        );
+      },
+    );
+
     test('a failed create rolls back to the previous list', () async {
       final gateway = _FakeGateway(
         projects: [_projectJson(id: 'p1', name: 'Kept')],
@@ -422,68 +477,76 @@ void main() {
         expect(gateway.calls, contains('projects.add_folder'));
         expect(created.folders, hasLength(1));
         expect(created.workingDirectory, '/srv/Projects/scripthive');
-        expect(repo.current.projects.single.workingDirectory,
-            '/srv/Projects/scripthive');
+        expect(
+          repo.current.projects.single.workingDirectory,
+          '/srv/Projects/scripthive',
+        );
       },
     );
 
-    test('a project that already has folders is never re-provisioned', () async {
-      final gateway = _FakeGateway();
-      final provisioned = <String>[];
-      final prefs = await SharedPreferences.getInstance();
-      final repo = ProjectsRepository(
-        client: ProjectsGatewayClient((method, params) async {
-          if (method == 'projects.create') {
-            return {
-              'jsonrpc': '2.0',
-              'id': 1,
-              'result': {
-                'project': {
-                  ..._projectJson(id: 'srv-1', name: 'ScriptHive'),
-                  'folders': [
-                    {
-                      'path': '/srv/existing',
-                      'label': 'existing',
-                      'is_primary': true,
-                      'added_at': 1,
-                    },
-                  ],
+    test(
+      'a project that already has folders is never re-provisioned',
+      () async {
+        final gateway = _FakeGateway();
+        final provisioned = <String>[];
+        final prefs = await SharedPreferences.getInstance();
+        final repo = ProjectsRepository(
+          client: ProjectsGatewayClient((method, params) async {
+            if (method == 'projects.create') {
+              return {
+                'jsonrpc': '2.0',
+                'id': 1,
+                'result': {
+                  'project': {
+                    ..._projectJson(id: 'srv-1', name: 'ScriptHive'),
+                    'folders': [
+                      {
+                        'path': '/srv/existing',
+                        'label': 'existing',
+                        'is_primary': true,
+                        'added_at': 1,
+                      },
+                    ],
+                  },
                 },
-              },
-            };
-          }
-          return gateway.call(method, params);
-        }),
-        preferences: prefs,
-        connectionId: 'gateway-a',
-        folderProvisioner: _RecordingProvisioner(provisioned),
-      );
-      await repo.refresh();
+              };
+            }
+            return gateway.call(method, params);
+          }),
+          preferences: prefs,
+          connectionId: 'gateway-a',
+          folderProvisioner: _RecordingProvisioner(provisioned),
+        );
+        await repo.refresh();
 
-      final created = await repo.create('ScriptHive');
+        final created = await repo.create('ScriptHive');
 
-      expect(provisioned, isEmpty);
-      expect(gateway.calls, isNot(contains('projects.add_folder')));
-      expect(created.workingDirectory, '/srv/existing');
-    });
+        expect(provisioned, isEmpty);
+        expect(gateway.calls, isNot(contains('projects.add_folder')));
+        expect(created.workingDirectory, '/srv/existing');
+      },
+    );
 
-    test('a failed folder bind keeps the created project, folderless', () async {
-      final gateway = _FakeGateway();
-      final prefs = await SharedPreferences.getInstance();
-      gateway.failMethod = 'projects.add_folder';
-      final repo = ProjectsRepository(
-        client: ProjectsGatewayClient(gateway.call),
-        preferences: prefs,
-        connectionId: 'gateway-a',
-        folderProvisioner: _StubProvisioner('/srv/Projects/scripthive'),
-      );
-      await repo.refresh();
+    test(
+      'a failed folder bind keeps the created project, folderless',
+      () async {
+        final gateway = _FakeGateway();
+        final prefs = await SharedPreferences.getInstance();
+        gateway.failMethod = 'projects.add_folder';
+        final repo = ProjectsRepository(
+          client: ProjectsGatewayClient(gateway.call),
+          preferences: prefs,
+          connectionId: 'gateway-a',
+          folderProvisioner: _StubProvisioner('/srv/Projects/scripthive'),
+        );
+        await repo.refresh();
 
-      final created = await repo.create('ScriptHive');
+        final created = await repo.create('ScriptHive');
 
-      expect(created.folders, isEmpty);
-      expect(repo.current.projects.single.name, 'ScriptHive');
-    });
+        expect(created.folders, isEmpty);
+        expect(repo.current.projects.single.name, 'ScriptHive');
+      },
+    );
 
     test(
       'rename applies immediately and survives the server round trip',
@@ -607,7 +670,10 @@ void main() {
             ),
           ],
         );
-        final repo = _repository(gateway, await SharedPreferences.getInstance());
+        final repo = _repository(
+          gateway,
+          await SharedPreferences.getInstance(),
+        );
         await repo.refresh();
 
         final reason = await repo.moveSessionToProject('s-1', 'p1');
@@ -622,47 +688,47 @@ void main() {
       },
     );
 
-    test(
-      'move re-homes the workspace to the target project folder',
-      () async {
-        final gateway = _FakeGateway(
-          projects: [
-            _projectJson(id: 'p1', name: 'Hermes Android'),
-            _projectJson(
-              id: 'p2',
-              name: 'ScriptHive',
-              folders: [
-                {
-                  'path': '/home/dev/scripthive',
-                  'label': 'main',
-                  'is_primary': true,
-                  'added_at': 1750000001,
-                },
-              ],
-            ),
-          ],
-        );
-        final repo = _repository(gateway, await SharedPreferences.getInstance());
-        await repo.refresh();
+    test('move re-homes the workspace to the target project folder', () async {
+      final gateway = _FakeGateway(
+        projects: [
+          _projectJson(id: 'p1', name: 'Hermes Android'),
+          _projectJson(
+            id: 'p2',
+            name: 'ScriptHive',
+            folders: [
+              {
+                'path': '/home/dev/scripthive',
+                'label': 'main',
+                'is_primary': true,
+                'added_at': 1750000001,
+              },
+            ],
+          ),
+        ],
+      );
+      final repo = _repository(gateway, await SharedPreferences.getInstance());
+      await repo.refresh();
 
-        final reason = await repo.moveSessionToProject(
-          's-1',
-          'p2',
-          storedSessionKey: 'stored-9',
-        );
+      final reason = await repo.moveSessionToProject(
+        's-1',
+        'p2',
+        storedSessionKey: 'stored-9',
+      );
 
-        expect(reason, isNull);
-        expect(gateway.workspaceMoves, [
-          {'session_key': 'stored-9', 'cwd': '/home/dev/scripthive'},
-        ]);
-      },
-    );
+      expect(reason, isNull);
+      expect(gateway.workspaceMoves, [
+        {'session_key': 'stored-9', 'cwd': '/home/dev/scripthive'},
+      ]);
+    });
 
     test(
       'moving back to Unassigned reports why (cwd-derived filing)',
       () async {
         final gateway = _FakeGateway();
-        final repo = _repository(gateway, await SharedPreferences.getInstance());
+        final repo = _repository(
+          gateway,
+          await SharedPreferences.getInstance(),
+        );
         await repo.refresh();
 
         final reason = await repo.moveSessionToProject('s-1', null);
@@ -672,44 +738,38 @@ void main() {
       },
     );
 
-    test(
-      'a folderless target asks for a folder',
-      () async {
-        final gateway = _FakeGateway(
-          projects: [_projectJson(id: 'p1', name: 'Name Only')],
-        );
-        final repo = _repository(gateway, await SharedPreferences.getInstance());
-        await repo.refresh();
+    test('a folderless target asks for a folder', () async {
+      final gateway = _FakeGateway(
+        projects: [_projectJson(id: 'p1', name: 'Name Only')],
+      );
+      final repo = _repository(gateway, await SharedPreferences.getInstance());
+      await repo.refresh();
 
-        final reason = await repo.moveSessionToProject('s-1', 'p1');
+      final reason = await repo.moveSessionToProject('s-1', 'p1');
 
-        expect(reason, contains('no folder'));
-        expect(gateway.workspaceMoves, isEmpty);
-      },
-    );
+      expect(reason, contains('no folder'));
+      expect(gateway.workspaceMoves, isEmpty);
+    });
 
-    test(
-      'the move uses the mobile id when no stored key is bound',
-      () async {
-        final gateway = _FakeGateway(
-          projects: [
-            _projectJson(
-              id: 'p2',
-              name: 'ScriptHive',
-              primaryPath: '/home/dev/scripthive',
-            ),
-          ],
-        );
-        final repo = _repository(gateway, await SharedPreferences.getInstance());
-        await repo.refresh();
+    test('the move uses the mobile id when no stored key is bound', () async {
+      final gateway = _FakeGateway(
+        projects: [
+          _projectJson(
+            id: 'p2',
+            name: 'ScriptHive',
+            primaryPath: '/home/dev/scripthive',
+          ),
+        ],
+      );
+      final repo = _repository(gateway, await SharedPreferences.getInstance());
+      await repo.refresh();
 
-        await repo.moveSessionToProject('mob-7', 'p2');
+      await repo.moveSessionToProject('mob-7', 'p2');
 
-        expect(gateway.workspaceMoves, [
-          {'session_key': 'mob-7', 'cwd': '/home/dev/scripthive'},
-        ]);
-      },
-    );
+      expect(gateway.workspaceMoves, [
+        {'session_key': 'mob-7', 'cwd': '/home/dev/scripthive'},
+      ]);
+    });
 
     test(
       'mutations are refused in compatibility mode without a call',

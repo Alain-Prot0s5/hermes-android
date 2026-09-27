@@ -1,9 +1,11 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <!-- Mutation gate for the PR #106 completion rules: whitelisted line
      ranges only — best-effort paging exhaustion, stale-generation discard,
-     durable reattach watermarks, persistent retry scheduling, and retained
-     terminal-failure handling. A surviving mutant here means a
-     reviewer-visible blocker class hides behind green CI. -->
+     durable reattach watermarks, persistent retry scheduling, exact prompt
+     send boundaries, retained terminal-failure handling, visible agent replies,
+     and exclusion of optimistic Project placeholders from durable cache. A
+     surviving mutant here means a reviewer-visible blocker class hides behind
+     green CI. -->
 <mutations version="1.2">
   <files>
     <file>lib/core/screens/session_list_screen.dart
@@ -15,21 +17,34 @@
       <lines begin="330" end="337"/>
     </file>
     <file>lib/core/services/connection_manager.dart
-      <lines begin="1535" end="1579"/>
+      <lines begin="1535" end="1568"/>
     </file>
     <file>lib/core/screens/chat_screen.dart
-      <lines begin="920" end="971"/>
-      <lines begin="974" end="1086"/>
-      <lines begin="2580" end="2634"/>
+      <lines begin="839" end="839"/>
+      <lines begin="922" end="973"/>
+      <lines begin="976" end="1091"/>
+      <lines begin="1672" end="1674"/>
+      <lines begin="1857" end="1859"/>
+      <lines begin="2191" end="2211"/>
+      <lines begin="2596" end="2644"/>
+      <lines begin="3146" end="3148"/>
     </file>
     <file>lib/core/services/desktop_gateway_client.dart
       <lines begin="411" end="447"/>
+      <lines begin="586" end="600"/>
     </file>
     <file>lib/core/services/ws_client.dart
-      <lines begin="943" end="979"/>
+      <lines begin="675" end="715"/>
+      <lines begin="958" end="993"/>
+    </file>
+    <file>lib/core/services/projects_repository.dart
+      <lines begin="834" end="840"/>
+    </file>
+    <file>lib/core/utils/chat_display_items.dart
+      <lines begin="49" end="52"/>
     </file>
   </files>
   <commands>
-    <command group="test" expected-return="0" working-directory="." timeout="240">flutter test --no-pub test/session_list_pinned_paging_test.dart test/chat_reattach_resync_test.dart test/connection_manager_test.dart test/project_folder_provisioner_test.dart</command>
+    <command group="test" expected-return="0" working-directory="." timeout="240">flutter test --no-pub test/session_list_pinned_paging_test.dart test/chat_reattach_resync_test.dart test/chat_turn_recovery_test.dart test/chat_display_items_test.dart test/connection_manager_test.dart test/projects_repository_test.dart test/project_folder_provisioner_test.dart</command>
   </commands>
 </mutations>

@@ -677,6 +677,7 @@ class WsClient {
     String method,
     Map<String, dynamic> params, {
     Duration timeout = const Duration(seconds: 30),
+    void Function()? onSent,
   }) async {
     if (!_connected || _channel == null) {
       throw Exception('Not connected');
@@ -692,14 +693,26 @@ class WsClient {
     });
 
     _pending[id] = _Pending(method, completer, timer);
-    _channel!.sink.add(
-      jsonEncode({
-        'jsonrpc': '2.0',
-        'method': method,
-        'params': withProfile(params, _profile),
-        'id': id,
-      }),
-    );
+    try {
+      _channel!.sink.add(
+        jsonEncode({
+          'jsonrpc': '2.0',
+          'method': method,
+          'params': withProfile(params, _profile),
+          'id': id,
+        }),
+      );
+    } catch (_) {
+      timer.cancel();
+      _pending.remove(id);
+      rethrow;
+    }
+    try {
+      onSent?.call();
+    } catch (_) {
+      // A local observer must not turn a successfully emitted RPC into an
+      // apparent transport failure.
+    }
     return completer.future;
   }
 
@@ -747,6 +760,7 @@ class WsClient {
     String message, {
     required String sessionId,
     required StreamCallback onEvent,
+    void Function()? onSent,
     Duration timeout = const Duration(minutes: 10),
   }) async {
     final completion = Completer<void>();
@@ -801,7 +815,7 @@ class WsClient {
       final response = await send('prompt.submit', {
         'session_id': sessionId,
         'text': message,
-      });
+      }, onSent: onSent);
       final error = response['error'];
       if (error != null) {
         throw _gatewayResponseError(
@@ -958,9 +972,9 @@ class WsClient {
     final runtimeSessionId = payload['session_id'] as String?;
     if (runtimeSessionId == null || runtimeSessionId.isEmpty) {
       throw StateError(
-          'session.resume succeeded without a session_id — refusing to bind '
-          'the caller-supplied id, which may not be the runtime session the '
-          'gateway resumed.',
+        'session.resume succeeded without a session_id — refusing to bind '
+        'the caller-supplied id, which may not be the runtime session the '
+        'gateway resumed.',
       );
     }
     final rawInflight = payload['inflight'];

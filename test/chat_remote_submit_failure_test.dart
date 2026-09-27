@@ -30,7 +30,13 @@ void main() {
         tester,
         drafts: drafts,
         remoteSubmit:
-            ({required sessionId, required text, required onEvent}) async {
+            ({
+              required sessionId,
+              required text,
+              required onEvent,
+              required onSent,
+            }) async {
+              onSent();
               submitCount += 1;
               submittedText = text;
               throw JsonRpcError(

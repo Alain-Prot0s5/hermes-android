@@ -207,11 +207,13 @@ Future<void> _expectFailClosedPromptDisconnect(
   try {
     await client.connect().timeout(const Duration(seconds: 5));
     Object? surfacedError;
+    var sentCount = 0;
     try {
       await client.submitPrompt(
         'Synthetic disconnect prompt',
         sessionId: 'disconnect-session',
         onEvent: events.add,
+        onSent: () => sentCount += 1,
         timeout: const Duration(seconds: 5),
       );
     } catch (error) {
@@ -227,6 +229,7 @@ Future<void> _expectFailClosedPromptDisconnect(
     );
     expect((surfacedError as JsonRpcError).reason, 'connection_closed');
     expect(connectionCount, 1);
+    expect(sentCount, 1);
     expect(requests, hasLength(1));
     expect(requests.single['params'], {
       'session_id': 'disconnect-session',
@@ -819,71 +822,71 @@ void main() {
 
     test('cancel-then-resend never reports the cancelled turn as done and '
         'never leaks its tokens into the new stream', () async {
-        final transport = _MultiStreamingClient();
-        final api = ApiClient(
-          baseUrl: 'http://hermes.local:8642',
-          apiKey: _raceKey,
-          httpClient: transport,
-        );
-        final gateway = GatewayChatClient(api);
-        final firstToken = Completer<void>();
-        var firstDone = false;
-        var secondDone = false;
-        final firstTokens = <String>[];
-        final secondTokens = <String>[];
+      final transport = _MultiStreamingClient();
+      final api = ApiClient(
+        baseUrl: 'http://hermes.local:8642',
+        apiKey: _raceKey,
+        httpClient: transport,
+      );
+      final gateway = GatewayChatClient(api);
+      final firstToken = Completer<void>();
+      var firstDone = false;
+      var secondDone = false;
+      final firstTokens = <String>[];
+      final secondTokens = <String>[];
 
-        final firstSending = gateway.sendMessageStreaming(
-          message: 'first',
-          sessionId: 'mob-race-1',
-          onToken: (t) {
-            firstTokens.add(t);
-            if (!firstToken.isCompleted) firstToken.complete();
-          },
-          onDone: () => firstDone = true,
-          onError: (_) {},
-        );
-        transport.controllers.first.add(
-          utf8.encode('data: {"choices":[{"delta":{"content":"one"}}]}\n\n'),
-        );
-        await firstToken.future;
+      final firstSending = gateway.sendMessageStreaming(
+        message: 'first',
+        sessionId: 'mob-race-1',
+        onToken: (t) {
+          firstTokens.add(t);
+          if (!firstToken.isCompleted) firstToken.complete();
+        },
+        onDone: () => firstDone = true,
+        onError: (_) {},
+      );
+      transport.controllers.first.add(
+        utf8.encode('data: {"choices":[{"delta":{"content":"one"}}]}\n\n'),
+      );
+      await firstToken.future;
 
-        // Cancel the first, then IMMEDIATELY start a second send — the
-        // old shared-flag design reset _activeStreamCancelled=false in
-        // the second call before the first call's post-await check ran,
-        // so the cancelled first turn reported onDone.
-        expect(await gateway.cancelActiveMessage(), isTrue);
-        final secondSending = gateway.sendMessageStreaming(
-          message: 'second',
-          sessionId: 'mob-race-2',
-          onToken: secondTokens.add,
-          onDone: () => secondDone = true,
-          onError: (_) {},
-        );
-        // Let the first call unwind fully with the second already active.
-        await firstSending;
+      // Cancel the first, then IMMEDIATELY start a second send — the
+      // old shared-flag design reset _activeStreamCancelled=false in
+      // the second call before the first call's post-await check ran,
+      // so the cancelled first turn reported onDone.
+      expect(await gateway.cancelActiveMessage(), isTrue);
+      final secondSending = gateway.sendMessageStreaming(
+        message: 'second',
+        sessionId: 'mob-race-2',
+        onToken: secondTokens.add,
+        onDone: () => secondDone = true,
+        onError: (_) {},
+      );
+      // Let the first call unwind fully with the second already active.
+      await firstSending;
       expect(
         firstDone,
         isFalse,
         reason: 'a cancelled turn must never report completion',
       );
 
-        // The orphaned first stream pushing late tokens must not reach
-        // any callback: the first stream's controller is still open but
-        // its subscription was cancelled; the second stream gets its own.
-        transport.latest.add(
-          utf8.encode('data: {"choices":[{"delta":{"content":"two"}}]}\n\n'),
-        );
-        await pumpEventQueue();
-        expect(secondTokens, ['two']);
+      // The orphaned first stream pushing late tokens must not reach
+      // any callback: the first stream's controller is still open but
+      // its subscription was cancelled; the second stream gets its own.
+      transport.latest.add(
+        utf8.encode('data: {"choices":[{"delta":{"content":"two"}}]}\n\n'),
+      );
+      await pumpEventQueue();
+      expect(secondTokens, ['two']);
       expect(firstTokens, [
         'one',
       ], reason: 'first stream delivered nothing after cancellation');
 
-        // Second stream completes normally.
-        await transport.latest.close();
-        await secondSending;
-        expect(secondDone, isTrue);
-        api.close();
+      // Second stream completes normally.
+      await transport.latest.close();
+      await secondSending;
+      expect(secondDone, isTrue);
+      api.close();
     });
   });
 
@@ -1233,127 +1236,127 @@ void main() {
 
     test('getArchivedSessions without a total falls back to the pin-bound '
         'proof and walks past a pin-only window', () async {
-        // The fallback branch (non-standard router that omits `total`):
-        // termination is the k-consecutive-zero-new-pages rule bounded by
-        // the max pins seen on any page. Reviewer shape at pageSize 2:
-        // window rows a0..a5 with a2,a3 pinned; the offset-2 window is
-        // pure pin repeats (zero new) while a4,a5 sit at offset 4.
-        // required = 2 ~/ 2 + 1 = 2 consecutive zero-new pages.
-        final requestedOffsets = <String>[];
-        final client = DashboardClient(
-          host: 'hermes.local',
-          port: 9119,
-          username: 'misha',
-          password: 'secret',
-          httpClient: MockClient((request) async {
-            if (request.url.path == '/auth/password-login') {
-              return http.Response(
-                '{"ok":true}',
-                200,
-                headers: {
-                  'set-cookie':
-                      'hermes_session_at=TOK123; Path=/; HttpOnly; SameSite=Lax',
-                },
-              );
-            }
-            if (request.url.path == '/api/sessions' &&
-                request.url.queryParameters['archived'] == 'only') {
-              final offset = int.parse(request.url.queryParameters['offset']!);
-              requestedOffsets.add(request.url.queryParameters['offset']!);
-              final limit = int.parse(request.url.queryParameters['limit']!);
-              final window = [
-                for (var i = offset; i < offset + limit && i < 6; i++)
-                  _archivedRow('a$i'),
-              ];
-              // Pins (a2, a3) back-filled on EVERY page.
-              final pins = [_archivedRow('a2'), _archivedRow('a3')]
-                ..forEach((p) => p['pinned'] = true);
-              final withPins = [
-                ...window,
-                for (final p in pins)
-                  if (!window.any((r) => r['id'] == p['id'])) p,
-              ];
-              // NO 'total' key — forces the client-side proof branch.
-              return http.Response(
-                jsonEncode({
-                  'sessions': withPins,
-                  'limit': limit,
-                  'offset': offset,
-                }),
-                200,
-              );
-            }
-            return http.Response('not found', 404);
-          }),
-        );
+      // The fallback branch (non-standard router that omits `total`):
+      // termination is the k-consecutive-zero-new-pages rule bounded by
+      // the max pins seen on any page. Reviewer shape at pageSize 2:
+      // window rows a0..a5 with a2,a3 pinned; the offset-2 window is
+      // pure pin repeats (zero new) while a4,a5 sit at offset 4.
+      // required = 2 ~/ 2 + 1 = 2 consecutive zero-new pages.
+      final requestedOffsets = <String>[];
+      final client = DashboardClient(
+        host: 'hermes.local',
+        port: 9119,
+        username: 'misha',
+        password: 'secret',
+        httpClient: MockClient((request) async {
+          if (request.url.path == '/auth/password-login') {
+            return http.Response(
+              '{"ok":true}',
+              200,
+              headers: {
+                'set-cookie':
+                    'hermes_session_at=TOK123; Path=/; HttpOnly; SameSite=Lax',
+              },
+            );
+          }
+          if (request.url.path == '/api/sessions' &&
+              request.url.queryParameters['archived'] == 'only') {
+            final offset = int.parse(request.url.queryParameters['offset']!);
+            requestedOffsets.add(request.url.queryParameters['offset']!);
+            final limit = int.parse(request.url.queryParameters['limit']!);
+            final window = [
+              for (var i = offset; i < offset + limit && i < 6; i++)
+                _archivedRow('a$i'),
+            ];
+            // Pins (a2, a3) back-filled on EVERY page.
+            final pins = [_archivedRow('a2'), _archivedRow('a3')]
+              ..forEach((p) => p['pinned'] = true);
+            final withPins = [
+              ...window,
+              for (final p in pins)
+                if (!window.any((r) => r['id'] == p['id'])) p,
+            ];
+            // NO 'total' key — forces the client-side proof branch.
+            return http.Response(
+              jsonEncode({
+                'sessions': withPins,
+                'limit': limit,
+                'offset': offset,
+              }),
+              200,
+            );
+          }
+          return http.Response('not found', 404);
+        }),
+      );
 
-        final sessions = await client.getArchivedSessions(pageSize: 2);
+      final sessions = await client.getArchivedSessions(pageSize: 2);
 
-        // The zero-new window at offset 2 did NOT end the walk: a4/a5
-        // were reached. (A mutant that required only ONE zero-new page —
-        // e.g. flipping the pinBound==0 ternary or dropping the +1 —
-        // stops at offset 4 and loses them.)
-        expect(requestedOffsets, contains('4'));
-        final ids = sessions.map((s) => s.id).toSet();
-        expect(ids, containsAll(<String>['a0', 'a1', 'a2', 'a3', 'a4', 'a5']));
-        expect(ids.length, 6, reason: 'pins deduped');
-        client.close();
+      // The zero-new window at offset 2 did NOT end the walk: a4/a5
+      // were reached. (A mutant that required only ONE zero-new page —
+      // e.g. flipping the pinBound==0 ternary or dropping the +1 —
+      // stops at offset 4 and loses them.)
+      expect(requestedOffsets, contains('4'));
+      final ids = sessions.map((s) => s.id).toSet();
+      expect(ids, containsAll(<String>['a0', 'a1', 'a2', 'a3', 'a4', 'a5']));
+      expect(ids.length, 6, reason: 'pins deduped');
+      client.close();
     });
 
     test('getArchivedSessions stops exactly when the offset covers total '
         '(no extra probe request at the boundary)', () async {
-        // total = 200, pageSize = 100: after the page at offset 100 the
-        // next offset (200) covers the total, so `offset >= total` must
-        // break WITHOUT issuing a third request. A `>` mutant issues one
-        // extra page past the end.
-        final requestedOffsets = <String>[];
-        final client = DashboardClient(
-          host: 'hermes.local',
-          port: 9119,
-          username: 'misha',
-          password: 'secret',
-          httpClient: MockClient((request) async {
-            if (request.url.path == '/auth/password-login') {
-              return http.Response(
-                '{"ok":true}',
-                200,
-                headers: {
-                  'set-cookie':
-                      'hermes_session_at=TOK123; Path=/; HttpOnly; SameSite=Lax',
-                },
-              );
-            }
-            if (request.url.path == '/api/sessions' &&
-                request.url.queryParameters['archived'] == 'only') {
-              final offset = int.parse(request.url.queryParameters['offset']!);
-              requestedOffsets.add(request.url.queryParameters['offset']!);
-              final limit = int.parse(request.url.queryParameters['limit']!);
-              final rows = [
-                for (var i = offset; i < offset + limit && i < 200; i++)
-                  _archivedRow('a$i'),
-              ];
-              return http.Response(
-                jsonEncode({
-                  'sessions': rows,
-                  'total': 200,
-                  'limit': limit,
-                  'offset': offset,
-                }),
-                200,
-              );
-            }
-            return http.Response('not found', 404);
-          }),
-        );
+      // total = 200, pageSize = 100: after the page at offset 100 the
+      // next offset (200) covers the total, so `offset >= total` must
+      // break WITHOUT issuing a third request. A `>` mutant issues one
+      // extra page past the end.
+      final requestedOffsets = <String>[];
+      final client = DashboardClient(
+        host: 'hermes.local',
+        port: 9119,
+        username: 'misha',
+        password: 'secret',
+        httpClient: MockClient((request) async {
+          if (request.url.path == '/auth/password-login') {
+            return http.Response(
+              '{"ok":true}',
+              200,
+              headers: {
+                'set-cookie':
+                    'hermes_session_at=TOK123; Path=/; HttpOnly; SameSite=Lax',
+              },
+            );
+          }
+          if (request.url.path == '/api/sessions' &&
+              request.url.queryParameters['archived'] == 'only') {
+            final offset = int.parse(request.url.queryParameters['offset']!);
+            requestedOffsets.add(request.url.queryParameters['offset']!);
+            final limit = int.parse(request.url.queryParameters['limit']!);
+            final rows = [
+              for (var i = offset; i < offset + limit && i < 200; i++)
+                _archivedRow('a$i'),
+            ];
+            return http.Response(
+              jsonEncode({
+                'sessions': rows,
+                'total': 200,
+                'limit': limit,
+                'offset': offset,
+              }),
+              200,
+            );
+          }
+          return http.Response('not found', 404);
+        }),
+      );
 
-        final sessions = await client.getArchivedSessions(pageSize: 100);
+      final sessions = await client.getArchivedSessions(pageSize: 100);
 
       expect(requestedOffsets, [
         '0',
         '100',
       ], reason: 'offset 200 covers total=200; no third request');
-        expect(sessions, hasLength(200));
-        client.close();
+      expect(sessions, hasLength(200));
+      client.close();
     });
 
     test('getArchivedSessions throws rather than present a cap-truncated '
@@ -3018,6 +3021,7 @@ void main() {
               sessionId: 'mobile-project',
               text: 'hello',
               onEvent: (_) {},
+              onSent: () {},
             )
             .then<void>((_) {}, onError: (_) {});
 

@@ -835,7 +835,7 @@ class ProjectsRepository {
     final payload = jsonEncode({
       'projects': [
         for (final project in [...view.projects, ...view.archived])
-          _projectToJson(project),
+          if (!project.id.startsWith('pending:')) _projectToJson(project),
       ],
       'active_id': view.activeId,
     });

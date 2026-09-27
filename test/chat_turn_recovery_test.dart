@@ -8,6 +8,7 @@ import 'package:hermes_android/core/models/attachment_draft.dart';
 import 'package:hermes_android/core/screens/chat_screen.dart';
 import 'package:hermes_android/core/services/attachment_draft_service.dart';
 import 'package:hermes_android/core/services/connection_manager.dart';
+import 'package:hermes_android/core/services/desktop_gateway_client.dart';
 import 'package:hermes_android/core/services/gateway_turn_application_controller.dart';
 import 'package:hermes_android/core/services/gateway_turn_coordinator.dart';
 import 'package:hermes_android/core/services/gateway_turn_recovery.dart';
@@ -96,6 +97,46 @@ void main() {
     expect(find.text('Done'), findsOneWidget);
   });
 
+  testWidgets('a recovery-v2 turn never arms legacy reattach polling', (
+    tester,
+  ) async {
+    final submitGate = Completer<void>();
+    final hook = TestDesktopConnectionHook();
+    final history = _ResyncChatHttpClient();
+    final session = _FakeTurnSession(
+      [const <GatewayTurnRecoveryState>[]],
+      submitResult: _completedState('Done'),
+      submitGate: submitGate,
+    );
+    await _pumpChat(
+      tester,
+      turnSession: session,
+      apiClient: ApiClient(
+        baseUrl: 'http://recovery.fixture',
+        apiKey: 'fixture-key',
+        httpClient: history,
+      ),
+      connectionHook: hook,
+    );
+
+    hook.handler?.call(DesktopConnectionState.connected);
+    await tester.pump();
+    await tester.enterText(find.byType(TextField), 'Durable turn');
+    await tester.tap(find.byTooltip('Send'));
+    await tester.pump();
+    expect(session.submitCount, 1);
+
+    hook.handler?.call(DesktopConnectionState.reconnecting);
+    await tester.pump();
+    expect(find.textContaining('will reattach automatically'), findsNothing);
+    hook.handler?.call(DesktopConnectionState.connected);
+    submitGate.complete();
+    await tester.pumpAndSettle();
+
+    expect(history.messageRequestCount, 1);
+    expect(find.text('Done'), findsOneWidget);
+  });
+
   testWidgets('composer stays blocked until pending recovery is known', (
     tester,
   ) async {
@@ -172,7 +213,13 @@ void main() {
         tester,
         turnSession: session,
         testRemotePromptSubmit:
-            ({required sessionId, required text, required onEvent}) async {
+            ({
+              required sessionId,
+              required text,
+              required onEvent,
+              required onSent,
+            }) async {
+              onSent();
               legacySubmitCount += 1;
               expect(sessionId, 'recovery-session');
               expect(text, 'Legacy once');
@@ -212,7 +259,13 @@ void main() {
         tester,
         turnSession: session,
         testRemotePromptSubmit:
-            ({required sessionId, required text, required onEvent}) async {
+            ({
+              required sessionId,
+              required text,
+              required onEvent,
+              required onSent,
+            }) async {
+              onSent();
               legacySubmitCount += 1;
             },
       );
@@ -257,7 +310,13 @@ void main() {
         turnSession: session,
         apiClient: apiClient,
         testRemotePromptSubmit:
-            ({required sessionId, required text, required onEvent}) {
+            ({
+              required sessionId,
+              required text,
+              required onEvent,
+              required onSent,
+            }) {
+              onSent();
               return submission.future;
             },
       );
@@ -322,7 +381,13 @@ void main() {
           tester,
           turnSession: session,
           testRemotePromptSubmit:
-              ({required sessionId, required text, required onEvent}) async {
+              ({
+                required sessionId,
+                required text,
+                required onEvent,
+                required onSent,
+              }) async {
+                onSent();
                 legacySubmitCount += 1;
               },
         );
@@ -387,7 +452,13 @@ void main() {
         return AttachmentUploadReceipt(refText: '@file:${draft.name}');
       },
       testRemotePromptSubmit:
-          ({required sessionId, required text, required onEvent}) async {
+          ({
+            required sessionId,
+            required text,
+            required onEvent,
+            required onSent,
+          }) async {
+            onSent();
             legacySubmitCount += 1;
             expect(text, contains('@file:photo.png'));
             expect(text, contains('@file:notes.txt'));
@@ -403,6 +474,72 @@ void main() {
     expect(session.stageCount, 0);
     expect(session.submitCount, 0);
   });
+
+  testWidgets('disconnect during a legacy attachment upload does not arm '
+      'prompt recovery', (tester) async {
+    final session = _FakeTurnSession(
+      const <Object>[],
+      recoverError: const GatewayTurnCoordinatorException(
+        GatewayTurnCoordinatorFailure.unsupportedCapability,
+      ),
+    );
+    final hook = TestDesktopConnectionHook();
+    final uploadGate = Completer<void>();
+    final history = _ResyncChatHttpClient();
+    var submitCount = 0;
+    await _pumpChat(
+      tester,
+      turnSession: session,
+      apiClient: ApiClient(
+        baseUrl: 'http://recovery.fixture',
+        apiKey: 'fixture-key',
+        httpClient: history,
+      ),
+      connectionHook: hook,
+      attachmentDraftService: _MemoryAttachmentDraftService(),
+      initialDrafts: [
+        AttachmentDraft(
+          id: 'upload-draft',
+          cachedPath: 'synthetic-upload',
+          name: 'upload.txt',
+          byteLength: 4,
+          mediaType: 'text/plain',
+          kind: AttachmentDraftKind.genericFile,
+        ),
+      ],
+      testRemoteAttachmentUpload: ({required draft, required dataUrl}) async {
+        await uploadGate.future;
+        return const AttachmentUploadReceipt(refText: '@file:upload');
+      },
+      testRemotePromptSubmit:
+          ({
+            required sessionId,
+            required text,
+            required onEvent,
+            required onSent,
+          }) async {
+            onSent();
+            submitCount += 1;
+          },
+    );
+
+    hook.handler?.call(DesktopConnectionState.connected);
+    await tester.pump();
+    await tester.enterText(find.byType(TextField), 'Upload first');
+    await tester.tap(find.byTooltip('Send'));
+    await tester.pump();
+    hook.handler?.call(DesktopConnectionState.reconnecting);
+    await tester.pump();
+
+    expect(find.textContaining('will reattach automatically'), findsNothing);
+    uploadGate.completeError(StateError('upload connection closed'));
+    await tester.pump();
+    await tester.pumpAndSettle();
+    hook.handler?.call(DesktopConnectionState.connected);
+    await tester.pump(const Duration(seconds: 3));
+    expect(submitCount, 0);
+    expect(history.messageRequestCount, 1);
+  });
 }
 
 Future<void> _pumpChat(
@@ -413,6 +550,7 @@ Future<void> _pumpChat(
   TestRemoteAttachmentUpload? testRemoteAttachmentUpload,
   AttachmentDraftService? attachmentDraftService,
   List<AttachmentDraft> initialDrafts = const [],
+  TestDesktopConnectionHook? connectionHook,
 }) async {
   apiClient ??= ApiClient(
     baseUrl: 'http://recovery.fixture',
@@ -445,6 +583,7 @@ Future<void> _pumpChat(
         testRemoteAttachmentUpload: testRemoteAttachmentUpload,
         testAttachmentDraftService: attachmentDraftService,
         testInitialAttachmentDrafts: initialDrafts,
+        testDesktopConnectionHook: connectionHook,
         testVoiceComposerAdapter: FakeVoiceComposerAdapter(),
       ),
     ),
@@ -499,6 +638,7 @@ class _FakeTurnSession implements GatewayTurnApplicationSession {
   final Object? submitError;
   final Object? recoverError;
   final Completer<void>? recoverGate;
+  final Completer<void>? submitGate;
   int recoverCount = 0;
   int submitCount = 0;
   int stageCount = 0;
@@ -511,6 +651,7 @@ class _FakeTurnSession implements GatewayTurnApplicationSession {
     this.submitError,
     this.recoverError,
     this.recoverGate,
+    this.submitGate,
   });
 
   @override
@@ -543,6 +684,7 @@ class _FakeTurnSession implements GatewayTurnApplicationSession {
   }) async {
     submitCount += 1;
     submittedTexts.add(text);
+    await submitGate?.future;
     if (submitError case final error?) throw error;
     final state = submitResult ?? _completedState('Done');
     onState?.call(state);

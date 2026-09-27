@@ -674,9 +674,9 @@ class ApiClient {
     int offset = 0,
     Duration timeout = requestTimeout,
   }) async {
-    final uri = Uri.parse('$baseUrl/api/sessions').replace(
-      queryParameters: {'limit': '$limit', 'offset': '$offset'},
-    );
+    final uri = Uri.parse(
+      '$baseUrl/api/sessions',
+    ).replace(queryParameters: {'limit': '$limit', 'offset': '$offset'});
     final res = await _http.get(uri, headers: _headers).timeout(timeout);
     if (res.statusCode != 200) {
       throw Exception('HTTP ${res.statusCode}: ${res.body}');
@@ -734,10 +734,7 @@ class ApiClient {
 
   Future<List<String>> getModels() async {
     final res = await _http
-        .get(
-          Uri.parse('$baseUrl/v1/models'),
-          headers: _headers,
-        )
+        .get(Uri.parse('$baseUrl/v1/models'), headers: _headers)
         .timeout(requestTimeout);
     if (res.statusCode != 200) {
       return ['hermes-agent'];
@@ -792,10 +789,7 @@ class ApiClient {
 
   Future<Map<String, dynamic>> apiGet(String endpoint) async {
     final res = await _http
-        .get(
-          Uri.parse('$baseUrl/$endpoint'),
-          headers: _headers,
-        )
+        .get(Uri.parse('$baseUrl/$endpoint'), headers: _headers)
         .timeout(requestTimeout);
     if (res.statusCode != 200) throw Exception('HTTP ${res.statusCode}');
     return jsonDecode(res.body) as Map<String, dynamic>;
@@ -803,10 +797,7 @@ class ApiClient {
 
   Future<List<dynamic>> apiGetList(String endpoint) async {
     final res = await _http
-        .get(
-          Uri.parse('$baseUrl/$endpoint'),
-          headers: _headers,
-        )
+        .get(Uri.parse('$baseUrl/$endpoint'), headers: _headers)
         .timeout(requestTimeout);
     if (res.statusCode != 200) throw Exception('HTTP ${res.statusCode}');
     return jsonDecode(res.body) as List<dynamic>;
@@ -831,10 +822,7 @@ class ApiClient {
 
   Future<void> apiDelete(String endpoint) async {
     final res = await _http
-        .delete(
-          Uri.parse('$baseUrl/$endpoint'),
-          headers: _headers,
-        )
+        .delete(Uri.parse('$baseUrl/$endpoint'), headers: _headers)
         .timeout(requestTimeout);
     if (res.statusCode < 200 || res.statusCode >= 300) {
       throw Exception('HTTP ${res.statusCode}');
@@ -1303,9 +1291,7 @@ class DashboardClient {
       r'((?:__Host-|__Secure-)?hermes_session_at)=([^;,\s]+)',
     ).firstMatch(setCookie);
     if (match == null) {
-      throw Exception(
-        'Dashboard login succeeded but no session cookie found',
-      );
+      throw Exception('Dashboard login succeeded but no session cookie found');
     }
     return '${match.group(1)}=${match.group(2)}';
   }
@@ -1371,10 +1357,7 @@ class DashboardClient {
     final authGeneration = _authGeneration;
     final headers = await _authHeaders();
     final res = await _http
-        .post(
-          Uri.parse('$_baseUrl/api/auth/ws-ticket'),
-          headers: headers,
-        )
+        .post(Uri.parse('$_baseUrl/api/auth/ws-ticket'), headers: headers)
         .timeout(ApiClient.requestTimeout);
     if (res.statusCode == 401 && !retried) {
       _resetAuth(ifGeneration: authGeneration);
@@ -1411,7 +1394,9 @@ class DashboardClient {
     final uri = Uri.parse(
       '$_baseUrl/api/$endpoint',
     ).replace(queryParameters: queryParameters);
-    final res = await _http.get(uri, headers: headers).timeout(ApiClient.requestTimeout);
+    final res = await _http
+        .get(uri, headers: headers)
+        .timeout(ApiClient.requestTimeout);
     if (res.statusCode == 401 && !retried) {
       _resetAuth(ifGeneration: authGeneration);
       return apiGet(endpoint, queryParameters: queryParameters, retried: true);
@@ -1430,7 +1415,9 @@ class DashboardClient {
     final uri = Uri.parse(
       '$_baseUrl/api/$endpoint',
     ).replace(queryParameters: queryParameters);
-    final res = await _http.get(uri, headers: headers).timeout(ApiClient.requestTimeout);
+    final res = await _http
+        .get(uri, headers: headers)
+        .timeout(ApiClient.requestTimeout);
     if (res.statusCode == 401 && !retried) {
       _resetAuth(ifGeneration: authGeneration);
       return apiGetBytes(
@@ -1517,14 +1504,17 @@ class DashboardClient {
     var pinBound = 0;
     var zeroNewPages = 0;
     for (var page = 0; page < maxPages; page++) {
-      final data = await apiGet('sessions', queryParameters: {
-        'archived': 'only',
-        'order': 'recent',
-        'limit': '$pageSize',
-        'offset': '$offset',
-        if (gatewayProfile != null && gatewayProfile.isNotEmpty)
-          'profile': gatewayProfile,
-      });
+      final data = await apiGet(
+        'sessions',
+        queryParameters: {
+          'archived': 'only',
+          'order': 'recent',
+          'limit': '$pageSize',
+          'offset': '$offset',
+          if (gatewayProfile != null && gatewayProfile.isNotEmpty)
+            'profile': gatewayProfile,
+        },
+      );
       // The dashboard router reports the filtered row count alongside the
       // page (`total = session_count(same scope)`), so the LIMIT/OFFSET
       // windows together cover exactly `total` rows — pins inside the

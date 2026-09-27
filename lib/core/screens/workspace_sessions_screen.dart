@@ -96,26 +96,25 @@ List<Session> filterChats({
               !session.archived && !isMachineSession(session),
             WorkspaceChatsFilter.recent =>
               !session.archived &&
-              !isMachineSession(session) &&
-              session.lastActive >= recentCutoff,
+                  !isMachineSession(session) &&
+                  session.lastActive >= recentCutoff,
             WorkspaceChatsFilter.unassigned =>
               // When the claim map is unknown (projects.tree timed out),
               // every chat would pass as 'unassigned' — a lie that turns
               // the whole archive into filing noise. Show none instead;
               // the UI surfaces the read failure.
               projectsKnown &&
-              !session.archived &&
-              !isMachineSession(session) &&
-              !claimedSessionIds.contains(
-                session.id,
-              ),
+                  !session.archived &&
+                  !isMachineSession(session) &&
+                  !claimedSessionIds.contains(session.id),
             WorkspaceChatsFilter.archived =>
               // Machine runs stay excluded even once archived — an archived
               // cron run is still cron noise, and its home is the Cron
               // screen's run drill-down. Quick-chat archives are human
               // rows and stay.
               !isMachineSession(session) &&
-              (session.archived || archivedQuickChatIds.contains(session.id)),
+                  (session.archived ||
+                      archivedQuickChatIds.contains(session.id)),
           } &&
           (normalized.isEmpty ||
               session.title.toLowerCase().contains(normalized) ||
@@ -210,8 +209,8 @@ List<Session> filterWorkspaceSessions({
             // bucket.
             WorkspaceSessionView.unassigned =>
               projectsKnown &&
-              !isMachineSession(session) &&
-              !claimedSessionIds.contains(session.id),
+                  !isMachineSession(session) &&
+                  !claimedSessionIds.contains(session.id),
             WorkspaceSessionView.archivedQuick => archivedQuickChatIds.contains(
               session.id,
             ),
@@ -312,10 +311,7 @@ class _WorkspaceSessionsScreenState extends State<WorkspaceSessionsScreen> {
             // The move claims the chat: add it to the claim set so the
             // Unassigned view drops the row immediately instead of
             // waiting for the next reload.
-            claimedSessionIds: {
-              ...data.claimedSessionIds,
-              session.id,
-            },
+            claimedSessionIds: {...data.claimedSessionIds, session.id},
             archivedQuickChatIds: {
               for (final id in data.archivedQuickChatIds)
                 if (id != session.id) id,
@@ -323,10 +319,7 @@ class _WorkspaceSessionsScreenState extends State<WorkspaceSessionsScreen> {
             // Ownership and its visible label are one piece of state. Updating
             // only claimedSessionIds made the row disappear from Unassigned,
             // then show "Unassigned" when All was selected immediately.
-            projectLabels: {
-              ...data.projectLabels,
-              session.id: projectLabel,
-            },
+            projectLabels: {...data.projectLabels, session.id: projectLabel},
             archivedSessions: data.archivedSessions,
             projectsKnown: data.projectsKnown,
           );

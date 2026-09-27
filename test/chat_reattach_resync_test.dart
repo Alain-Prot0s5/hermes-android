@@ -46,7 +46,14 @@ void main() {
         apiClient: apiClient,
         ensureCount: () => ensureCount++,
         storedKey: 'stored_sess_9f3a',
-        remoteSubmit: ({required sessionId, required text, required onEvent}) {
+        remoteSubmit:
+            ({
+              required sessionId,
+              required text,
+              required onEvent,
+              required onSent,
+            }) {
+              onSent();
               return submission.future;
             },
       );
@@ -150,7 +157,14 @@ void main() {
         apiClient: apiClient,
         ensureCount: () {},
         storedKey: 'stored_sess_retry',
-        remoteSubmit: ({required sessionId, required text, required onEvent}) {
+        remoteSubmit:
+            ({
+              required sessionId,
+              required text,
+              required onEvent,
+              required onSent,
+            }) {
+              onSent();
               return submission.future;
             },
       );
@@ -219,9 +233,16 @@ void main() {
         apiClient: apiClient,
         ensureCount: () {},
         storedKey: 'stored_sess_connection',
-        remoteSubmit: ({required sessionId, required text, required onEvent}) {
-          return submission.future;
-        },
+        remoteSubmit:
+            ({
+              required sessionId,
+              required text,
+              required onEvent,
+              required onSent,
+            }) {
+              onSent();
+              return submission.future;
+            },
       );
 
       hook.handler?.call(DesktopConnectionState.connected);
@@ -293,7 +314,14 @@ void main() {
         apiClient: apiClient,
         ensureCount: () {},
         storedKey: 'stored_sess_longturn',
-        remoteSubmit: ({required sessionId, required text, required onEvent}) {
+        remoteSubmit:
+            ({
+              required sessionId,
+              required text,
+              required onEvent,
+              required onSent,
+            }) {
+              onSent();
               return submission.future;
             },
       );
@@ -381,9 +409,16 @@ void main() {
         apiClient: apiClient,
         ensureCount: () {},
         storedKey: 'stored_sess_capped',
-        remoteSubmit: ({required sessionId, required text, required onEvent}) {
-          return submission.future;
-        },
+        remoteSubmit:
+            ({
+              required sessionId,
+              required text,
+              required onEvent,
+              required onSent,
+            }) {
+              onSent();
+              return submission.future;
+            },
       );
 
       hook.handler?.call(DesktopConnectionState.connected);
@@ -418,136 +453,148 @@ void main() {
 
   testWidgets('watermark accepts an agent-role reply as terminal (not just '
       'assistant-role)', (tester) async {
-      // The watermark's role check is `role != 'assistant' && role !=
-      // 'agent'` — some stock rows carry role 'agent'. If the 'agent'
-      // branch were dropped, this reply would never satisfy the watermark
-      // and the resync would spin the whole budget instead of stopping.
-      final hook = TestDesktopConnectionHook();
-      final submission = Completer<void>();
-      final history = _ReattachChatHttpClient()
-        ..oldHistory = const [
+    // The watermark's role check is `role != 'assistant' && role !=
+    // 'agent'` — some stock rows carry role 'agent'. If the 'agent'
+    // branch were dropped, this reply would never satisfy the watermark
+    // and the resync would spin the whole budget instead of stopping.
+    final hook = TestDesktopConnectionHook();
+    final submission = Completer<void>();
+    final history = _ReattachChatHttpClient()
+      ..oldHistory = const [
         {'id': 1, 'role': 'user', 'content': 'Earlier question'},
         {'id': 2, 'role': 'assistant', 'content': 'Earlier answer'},
-        ]
-        ..userOnlyUntilRequest = 2
-        ..replyRole = 'agent';
-      final apiClient = ApiClient(
-        baseUrl: 'http://reattach.fixture',
-        apiKey: 'reattach-key',
-        httpClient: history,
-      );
-      await _pumpChat(
-        tester,
-        hook: hook,
-        apiClient: apiClient,
-        ensureCount: () {},
-        storedKey: 'stored_sess_agentrole',
-      remoteSubmit: ({required sessionId, required text, required onEvent}) {
-              return submission.future;
-            },
-      );
+      ]
+      ..userOnlyUntilRequest = 2
+      ..replyRole = 'agent';
+    final apiClient = ApiClient(
+      baseUrl: 'http://reattach.fixture',
+      apiKey: 'reattach-key',
+      httpClient: history,
+    );
+    await _pumpChat(
+      tester,
+      hook: hook,
+      apiClient: apiClient,
+      ensureCount: () {},
+      storedKey: 'stored_sess_agentrole',
+      remoteSubmit:
+          ({
+            required sessionId,
+            required text,
+            required onEvent,
+            required onSent,
+          }) {
+            onSent();
+            return submission.future;
+          },
+    );
 
-      hook.handler?.call(DesktopConnectionState.connected);
-      await tester.pump();
-      await tester.enterText(find.byType(TextField), 'Long running task');
-      await tester.tap(find.byTooltip('Send'));
-      await tester.pump();
-      await tester.pump();
+    hook.handler?.call(DesktopConnectionState.connected);
+    await tester.pump();
+    await tester.enterText(find.byType(TextField), 'Long running task');
+    await tester.tap(find.byTooltip('Send'));
+    await tester.pump();
+    await tester.pump();
 
-      hook.handler?.call(DesktopConnectionState.reconnecting);
-      await tester.pump();
-      submission.completeError(
-        JsonRpcError('prompt.submit', 'Desktop gateway connection closed'),
-      );
-      await tester.pump();
-      await tester.pumpAndSettle();
+    hook.handler?.call(DesktopConnectionState.reconnecting);
+    await tester.pump();
+    submission.completeError(
+      JsonRpcError('prompt.submit', 'Desktop gateway connection closed'),
+    );
+    await tester.pump();
+    await tester.pumpAndSettle();
 
-      hook.handler?.call(DesktopConnectionState.connected);
-      await tester.pump();
-      await tester.pump(const Duration(milliseconds: 100));
-      await tester.pump(const Duration(milliseconds: 100));
-      await tester.pump(const Duration(seconds: 4));
+    hook.handler?.call(DesktopConnectionState.connected);
+    await tester.pump();
+    await tester.pump(const Duration(milliseconds: 100));
+    await tester.pump(const Duration(milliseconds: 100));
+    await tester.pump(const Duration(seconds: 4));
 
-      // The agent-role reply satisfies the watermark: the resync STOPS
-      // promptly instead of burning all 10 attempts. (The text itself
-      // does not render — the display builder only shows user/assistant
-      // rows — so the observable is the settled request count, not a
-      // rendered bubble.)
-      final settledCount = history.messageRequestCount;
-      expect(
-        settledCount,
-        lessThanOrEqualTo(5),
+    // The agent-role reply satisfies the watermark and is normalized to an
+    // assistant bubble instead of stopping recovery on an invisible row.
+    expect(find.text('Server-side final response'), findsOneWidget);
+    final settledCount = history.messageRequestCount;
+    expect(
+      settledCount,
+      lessThanOrEqualTo(5),
       reason:
           'an agent-role terminal row must end the resync, not '
-            'spin the full 10-attempt budget',
-      );
-      await tester.pump(const Duration(seconds: 5));
-      expect(
-        history.messageRequestCount,
-        settledCount,
-        reason: 'an agent-role terminal row must end the resync',
-      );
+          'spin the full 10-attempt budget',
+    );
+    await tester.pump(const Duration(seconds: 5));
+    expect(
+      history.messageRequestCount,
+      settledCount,
+      reason: 'an agent-role terminal row must end the resync',
+    );
   });
 
   testWidgets('watermark rejects a tool-call intermediate reply; resync keeps '
       'waiting for the final row', (tester) async {
-      // A reply row with a non-empty tool_calls list is an intermediate,
-      // not the final answer. If the tool_calls skip were dropped, the
-      // resync would stop on the intermediate and never show the real
-      // final reply that lands later.
-      final hook = TestDesktopConnectionHook();
-      final submission = Completer<void>();
-      final history = _ReattachChatHttpClient()
-        ..oldHistory = const [
+    // A reply row with a non-empty tool_calls list is an intermediate,
+    // not the final answer. If the tool_calls skip were dropped, the
+    // resync would stop on the intermediate and never show the real
+    // final reply that lands later.
+    final hook = TestDesktopConnectionHook();
+    final submission = Completer<void>();
+    final history = _ReattachChatHttpClient()
+      ..oldHistory = const [
         {'id': 1, 'role': 'user', 'content': 'Earlier question'},
         {'id': 2, 'role': 'assistant', 'content': 'Earlier answer'},
-        ]
-        ..userOnlyUntilRequest = 2
-        ..replyHasToolCalls = true;
-      final apiClient = ApiClient(
-        baseUrl: 'http://reattach.fixture',
-        apiKey: 'reattach-key',
-        httpClient: history,
-      );
-      await _pumpChat(
-        tester,
-        hook: hook,
-        apiClient: apiClient,
-        ensureCount: () {},
-        storedKey: 'stored_sess_toolcall',
-      remoteSubmit: ({required sessionId, required text, required onEvent}) {
-              return submission.future;
-            },
-      );
+      ]
+      ..userOnlyUntilRequest = 2
+      ..replyHasToolCalls = true;
+    final apiClient = ApiClient(
+      baseUrl: 'http://reattach.fixture',
+      apiKey: 'reattach-key',
+      httpClient: history,
+    );
+    await _pumpChat(
+      tester,
+      hook: hook,
+      apiClient: apiClient,
+      ensureCount: () {},
+      storedKey: 'stored_sess_toolcall',
+      remoteSubmit:
+          ({
+            required sessionId,
+            required text,
+            required onEvent,
+            required onSent,
+          }) {
+            onSent();
+            return submission.future;
+          },
+    );
 
-      hook.handler?.call(DesktopConnectionState.connected);
-      await tester.pump();
-      await tester.enterText(find.byType(TextField), 'Long running task');
-      await tester.tap(find.byTooltip('Send'));
-      await tester.pump();
-      await tester.pump();
+    hook.handler?.call(DesktopConnectionState.connected);
+    await tester.pump();
+    await tester.enterText(find.byType(TextField), 'Long running task');
+    await tester.tap(find.byTooltip('Send'));
+    await tester.pump();
+    await tester.pump();
 
-      hook.handler?.call(DesktopConnectionState.reconnecting);
-      await tester.pump();
-      submission.completeError(
-        JsonRpcError('prompt.submit', 'Desktop gateway connection closed'),
-      );
-      await tester.pump();
-      await tester.pumpAndSettle();
+    hook.handler?.call(DesktopConnectionState.reconnecting);
+    await tester.pump();
+    submission.completeError(
+      JsonRpcError('prompt.submit', 'Desktop gateway connection closed'),
+    );
+    await tester.pump();
+    await tester.pumpAndSettle();
 
-      hook.handler?.call(DesktopConnectionState.connected);
-      await tester.pump();
-      await tester.pump(const Duration(milliseconds: 100));
-      await tester.pump(const Duration(milliseconds: 100));
-      await tester.pump(const Duration(seconds: 4));
+    hook.handler?.call(DesktopConnectionState.connected);
+    await tester.pump();
+    await tester.pump(const Duration(milliseconds: 100));
+    await tester.pump(const Duration(milliseconds: 100));
+    await tester.pump(const Duration(seconds: 4));
 
-      // Past the point where the tool-call row was served: the resync is
+    // Past the point where the tool-call row was served: the resync is
     // still running because the intermediate is not terminal.
-      expect(
-        history.messageRequestCount,
-        greaterThan(3),
-        reason: 'a tool-call intermediate must not end the resync',
-      );
+    expect(
+      history.messageRequestCount,
+      greaterThan(3),
+      reason: 'a tool-call intermediate must not end the resync',
+    );
 
     // The same durable row is later finalized without tool_calls. The
     // next retry accepts it and cancels the otherwise unbounded timer.
@@ -576,7 +623,12 @@ void main() {
         apiClient: apiClient,
         ensureCount: () {},
         remoteSubmit:
-            ({required sessionId, required text, required onEvent}) async {
+            ({
+              required sessionId,
+              required text,
+              required onEvent,
+              required onSent,
+            }) async {
               throw JsonRpcError(
                 'prompt.submit',
                 'Desktop gateway connection closed',
@@ -618,9 +670,16 @@ void main() {
         asyncHook: asyncHook,
         apiClient: apiClient,
         ensureCount: () {},
-        remoteSubmit: ({required sessionId, required text, required onEvent}) {
-          return submission.future;
-        },
+        remoteSubmit:
+            ({
+              required sessionId,
+              required text,
+              required onEvent,
+              required onSent,
+            }) {
+              onSent();
+              return submission.future;
+            },
       );
 
       hook.handler?.call(DesktopConnectionState.connected);
@@ -647,6 +706,25 @@ void main() {
         isNull,
         reason: 'reattach recovery must still be pending before the failure',
       );
+      expect(
+        tester
+            .widget<TextButton>(find.widgetWithIcon(TextButton, Icons.tune))
+            .onPressed,
+        isNull,
+        reason: 'model changes must not race the authoritative history fetch',
+      );
+      await tester.tap(find.byTooltip('Chat actions'));
+      await tester.pumpAndSettle();
+      final refreshItem = find.ancestor(
+        of: find.text('Refresh'),
+        matching: find.byType(PopupMenuItem<String>),
+      );
+      expect(
+        tester.widget<PopupMenuItem<String>>(refreshItem).enabled,
+        isFalse,
+      );
+      await tester.tapAt(Offset.zero);
+      await tester.pumpAndSettle();
 
       asyncHook.handler?.call(
         StreamEvent(
@@ -672,43 +750,188 @@ void main() {
     },
   );
 
-  testWidgets('reconnect with no turn in flight does not trigger a resync', (
-    tester,
-  ) async {
+  testWidgets(
+    'a stale recovery flight hands the single-flight slot to a newer turn',
+    (tester) async {
       final hook = TestDesktopConnectionHook();
-      var ensureCount = 0;
+      final asyncHook = TestDesktopAsyncEventHook();
+      final submissions = <Completer<void>>[];
+      final blockedHistory = Completer<void>();
+      final history = _ReattachChatHttpClient()
+        ..userOnlyTurn = true
+        ..blockMessageRequest = 2
+        ..blockedMessageGate = blockedHistory;
+      final apiClient = ApiClient(
+        baseUrl: 'http://reattach.fixture',
+        apiKey: 'fixture-key',
+        httpClient: history,
+      );
+      await _pumpChat(
+        tester,
+        hook: hook,
+        asyncHook: asyncHook,
+        apiClient: apiClient,
+        ensureCount: () {},
+        remoteSubmit:
+            ({
+              required sessionId,
+              required text,
+              required onEvent,
+              required onSent,
+            }) {
+              onSent();
+              final submission = Completer<void>();
+              submissions.add(submission);
+              return submission.future;
+            },
+      );
+
+      hook.handler?.call(DesktopConnectionState.connected);
+      await tester.pump();
+      await tester.enterText(find.byType(TextField), 'Generation A');
+      await tester.tap(find.byTooltip('Send'));
+      await tester.pump();
+      hook.handler?.call(DesktopConnectionState.reconnecting);
+      submissions.single.completeError(
+        JsonRpcError('prompt.submit', 'Desktop gateway connection closed'),
+      );
+      await tester.pump();
+      hook.handler?.call(DesktopConnectionState.connected);
+      await tester.pump();
+      expect(history.messageRequestCount, 2);
+
+      asyncHook.handler?.call(
+        StreamEvent(
+          type: 'turn.error',
+          data: const {'status': 'error', 'message': 'Generation A failed'},
+          isComplete: true,
+        ),
+      );
+      await tester.pump();
+
+      await tester.enterText(find.byType(TextField), 'Generation B');
+      await tester.tap(find.byTooltip('Send'));
+      await tester.pump();
+      expect(submissions, hasLength(2));
+      hook.handler?.call(DesktopConnectionState.reconnecting);
+      submissions.last.completeError(
+        JsonRpcError('prompt.submit', 'Desktop gateway connection closed'),
+      );
+      await tester.pump();
+      hook.handler?.call(DesktopConnectionState.connected);
+      await tester.pump();
+
+      history
+        ..userOnlyTurn = false
+        ..includeCompletedTurn = true;
+      blockedHistory.complete();
+      await tester.pump();
+      await tester.pump(const Duration(milliseconds: 100));
+      await tester.pump(const Duration(milliseconds: 100));
+
+      expect(
+        history.messageRequestCount,
+        3,
+        reason: 'generation B must run as soon as stale generation A unwinds',
+      );
+      expect(find.text('Server-side final response'), findsOneWidget);
+      final settledCount = history.messageRequestCount;
+      await tester.pump(const Duration(minutes: 1));
+      expect(history.messageRequestCount, settledCount);
+    },
+  );
+
+  testWidgets(
+    'disconnect before the prompt wire-send boundary never arms recovery',
+    (tester) async {
+      final hook = TestDesktopConnectionHook();
+      final beforeWire = Completer<void>();
       final history = _ReattachChatHttpClient();
       final apiClient = ApiClient(
         baseUrl: 'http://reattach.fixture',
-        apiKey: 'reattach-key',
+        apiKey: 'fixture-key',
         httpClient: history,
       );
       await _pumpChat(
         tester,
         hook: hook,
         apiClient: apiClient,
-        ensureCount: () => ensureCount++,
+        ensureCount: () {},
         remoteSubmit:
-            ({required sessionId, required text, required onEvent}) async {},
+            ({
+              required sessionId,
+              required text,
+              required onEvent,
+              required onSent,
+            }) => beforeWire.future,
       );
 
       hook.handler?.call(DesktopConnectionState.connected);
+      await tester.pump();
+      await tester.enterText(find.byType(TextField), 'Binding phase');
+      await tester.tap(find.byTooltip('Send'));
       await tester.pump();
       hook.handler?.call(DesktopConnectionState.reconnecting);
       await tester.pump();
-      hook.handler?.call(DesktopConnectionState.connected);
-      await tester.pumpAndSettle();
 
-      // Idle drop: no snackbar, no extra ensure, no extra history fetch.
-      expect(
-        find.text(
-          'Connection switched — the running reply continues on the '
-          'server and will reattach automatically.',
-        ),
-        findsNothing,
+      expect(find.textContaining('will reattach automatically'), findsNothing);
+      beforeWire.completeError(
+        JsonRpcError('session.resume', 'Desktop gateway connection closed'),
       );
-      expect(ensureCount, 0);
+      await tester.pump();
+      await tester.pumpAndSettle();
+      hook.handler?.call(DesktopConnectionState.connected);
+      await tester.pump(const Duration(seconds: 3));
       expect(history.messageRequestCount, 1);
+      expect(
+        tester.widget<TextField>(find.byType(TextField)).controller!.text,
+        'Binding phase',
+      );
+    },
+  );
+
+  testWidgets('reconnect with no turn in flight does not trigger a resync', (
+    tester,
+  ) async {
+    final hook = TestDesktopConnectionHook();
+    var ensureCount = 0;
+    final history = _ReattachChatHttpClient();
+    final apiClient = ApiClient(
+      baseUrl: 'http://reattach.fixture',
+      apiKey: 'reattach-key',
+      httpClient: history,
+    );
+    await _pumpChat(
+      tester,
+      hook: hook,
+      apiClient: apiClient,
+      ensureCount: () => ensureCount++,
+      remoteSubmit:
+          ({
+            required sessionId,
+            required text,
+            required onEvent,
+            required onSent,
+          }) async {},
+    );
+
+    hook.handler?.call(DesktopConnectionState.connected);
+    await tester.pump();
+    hook.handler?.call(DesktopConnectionState.reconnecting);
+    await tester.pump();
+    hook.handler?.call(DesktopConnectionState.connected);
+    await tester.pumpAndSettle();
+
+    // Idle drop: no snackbar, no extra ensure, no extra history fetch.
+    expect(
+      find.text(
+        'Connection switched — the running reply continues on the '
+        'server and will reattach automatically.',
+      ),
+      findsNothing,
+    );
+    expect(ensureCount, 0);
+    expect(history.messageRequestCount, 1);
   });
 }
 
@@ -759,6 +982,8 @@ Future<void> _pumpChat(
 class _ReattachChatHttpClient extends http.BaseClient {
   int messageRequestCount = 0;
   bool includeCompletedTurn = false;
+  int? blockMessageRequest;
+  Completer<void>? blockedMessageGate;
 
   /// Rows served BEFORE the detached turn's rows — the transcript that
   /// existed before the drop. The resync watermark counts growth past
@@ -876,6 +1101,9 @@ class _ReattachChatHttpClient extends http.BaseClient {
     if (request.method == 'GET' && request.url.path.endsWith('/messages')) {
       messageRequestCount += 1;
       requestedMessagePaths.add(request.url.path);
+      if (messageRequestCount == blockMessageRequest) {
+        await blockedMessageGate?.future;
+      }
       if (failMessagesAfterFirst > 0 &&
           messageRequestCount > failMessagesAfterFirst) {
         return http.StreamedResponse(

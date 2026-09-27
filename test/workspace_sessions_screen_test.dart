@@ -330,7 +330,11 @@ void main() {
       // dashboard-sourced archivedSessions list is the only way an
       // explicitly archived chat reaches the chip. It must show under
       // Archived and stay hidden under All.
-      final serverArchived = _session('s9', 'Archived on server', archived: true);
+      final serverArchived = _session(
+        's9',
+        'Archived on server',
+        archived: true,
+      );
       await tester.pumpWidget(
         MaterialApp(
           theme: hermesTheme(Brightness.dark),
@@ -486,7 +490,10 @@ void main() {
           title: 'Unassigned chats',
           view: WorkspaceSessionView.unassigned,
           load: () async => WorkspaceSessionsData(
-            sessions: [_session('s1', 'Loose chat'), _session('s2', 'Also loose')],
+            sessions: [
+              _session('s1', 'Loose chat'),
+              _session('s2', 'Also loose'),
+            ],
           ),
           onOpenSession: (_) {},
           onPromote: (session) async {

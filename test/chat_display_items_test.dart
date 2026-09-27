@@ -36,6 +36,20 @@ void main() {
       expect(assistant['_display_content'], 'answer');
     });
 
+    test('normalizes persisted agent replies to assistant bubbles', () {
+      final items = buildChatDisplayItems(
+        messages: [
+          {'role': 'user', 'content': 'question'},
+          {'role': 'agent', 'content': 'answer'},
+        ],
+      );
+
+      final reply = items.last as Map<String, dynamic>;
+      expect(reply['role'], 'assistant');
+      expect(reply['_display_content'], 'answer');
+      expect(reply['_retry_prompt'], 'question');
+    });
+
     test('tags each assistant reply with the last user prompt for retry', () {
       final items = buildChatDisplayItems(
         messages: [

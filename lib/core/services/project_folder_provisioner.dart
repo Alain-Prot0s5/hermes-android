@@ -165,17 +165,20 @@ class DashboardFolderProvisioner implements ProjectFolderProvisioner {
     final markerName = 'hermes-provision-$token.owner';
     final markerPath = '$path/$markerName';
     try {
-      await dashboard.apiPost('fs/write-text', body: {
-        'path': markerPath,
-        'content': token,
-      });
+      await dashboard.apiPost(
+        'fs/write-text',
+        body: {'path': markerPath, 'content': token},
+      );
     } catch (_) {
       // Write refused (read-only mount, permission, path policy): the
       // folder is not ours to claim.
       return false;
     }
     try {
-      final res = await dashboard.apiGet('files', queryParameters: {'path': path});
+      final res = await dashboard.apiGet(
+        'files',
+        queryParameters: {'path': path},
+      );
       final entries = res['entries'];
       if (entries is! List || entries.length != 1) return false;
       final entry = entries.first;
