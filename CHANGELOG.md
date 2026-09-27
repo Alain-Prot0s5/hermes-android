@@ -4,6 +4,44 @@ All notable changes to this project are documented here. This project adheres to
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html). Release notes for
 versions prior to 1.0.7 are in the **What's new** sections of the [README](README.md).
 
+## [2.1.7] - 2026-09-28
+
+### Added
+
+- Safely provision folders for name-only Projects, while refusing to adopt a
+  directory whose ownership cannot be established.
+- Show complete project ownership and server-archived chat information in the
+  workspace using stock Hermes gateway contracts.
+
+### Fixed
+
+- Detached replies now recover across long outages, app backgrounding, capped
+  message-history rollover, temporary fetch failures, and retained terminal
+  failures without restoring the composer too early or polling forever.
+- Session pagination now handles repeated pinned backfills without skipping or
+  duplicating rows, and no longer prunes assignments from a mutable OFFSET scan
+  that cannot prove deletion.
+- Project creation, rename, archive, delete, selection, refresh, and cache writes
+  now reconcile concurrent optimistic changes without persisting placeholders,
+  losing confirmed updates, or allowing a disposed repository to overwrite a
+  newer one.
+- Stock gateway session moves use `session.workspace.move`; the never-shipped
+  `projects.assign_session` dependency has been removed.
+- Archived reads are profile-scoped and paged completely; machine-generated
+  sessions stay out of human chat lists and unknown project maps no longer label
+  chats as unassigned.
+- WebSocket creation, session resume, dashboard authentication, HTTP timeouts,
+  SSE cancellation, and stale runtime-session recovery are hardened against
+  duplicate sockets, leaked streams, zombie reconnects, and stale in-flight
+  state.
+- Android now declares speech-recognition service visibility, restoring voice
+  dictation discovery on Android 11 and newer.
+
+### Thanks
+
+- @Thaeland for the extensive stock-Hermes compatibility implementation,
+  diagnostics, and regression coverage in PR #106.
+
 ## [2.1.6] - 2026-09-26
 
 ### Fixed

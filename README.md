@@ -1,4 +1,4 @@
-# Hermes Android — v2.1.6
+# Hermes Android — v2.1.7
 
 Android client for [Hermes Agent](https://hermes-agent.nousresearch.com/) — chat with your Hermes sessions from a phone or tablet over local Wi-Fi or a private Tailscale network.
 
@@ -14,7 +14,7 @@ Android client for [Hermes Agent](https://hermes-agent.nousresearch.com/) — ch
 
 ## Current release
 
-- Version: **2.1.6** (build 2146)
+- Version: **2.1.7** (build 2147)
 - Package: `com.hermesagent.hermes_android`
 - Recommended APK for modern phones: ARM64 release build from the
   [Releases](https://github.com/rusty4444/hermes-android/releases) page.
@@ -57,6 +57,31 @@ gateway explicitly advertises the compatible recovery contract.
 See [CHANGELOG.md](CHANGELOG.md) for the complete `.13` change list and
 [docs/HERMESAPK_DEVELOPMENT_LOG.md](docs/HERMESAPK_DEVELOPMENT_LOG.md) for the
 sanitized implementation and validation record.
+
+## What's new in v2.1.7
+
+v2.1.7 brings the Android daily-driver workspace into line with stock Hermes
+gateways through the extensive compatibility work contributed by
+[@Thaeland](https://github.com/Thaeland) in PR #106.
+
+- **Reliable detached replies** — interrupted socket connections now resume the
+  stored session, keep retrying across long-running turns and app backgrounding,
+  and use durable message IDs so replies are recovered even when the server's
+  capped history window rolls over.
+- **Stock Projects support** — new Projects receive safely provisioned folders,
+  chat moves use the stock `session.workspace.move` contract, and project labels,
+  archived chats, migration, search, and compatibility states follow the real
+  gateway wire shapes.
+- **Correct session pagination** — pinned-session backfills can no longer skip,
+  duplicate, or prematurely end later pages. Mutable OFFSET scans no longer
+  delete local assignments they cannot prove are stale.
+- **Safer transport and offline state** — stale runtime bindings reattach,
+  socket creation and authentication are single-flight, network requests are
+  bounded, and concurrent Project mutations cannot persist optimistic or stale
+  cache snapshots.
+- **Additional resilience** — archived reads are profile-scoped and complete,
+  machine sessions stay out of human chat lists, deliberate reconnects are
+  explained, and Android can discover installed speech-recognition services.
 
 ## What's new in v2.1.6
 
@@ -505,7 +530,7 @@ cp build/app/outputs/flutter-apk/app-*-release.apk release-apks/
 block in `android/app/build.gradle.kts` derives per-ABI codes as
 `base * 10 + ABI code` (armeabi-v7a = 1, arm64-v8a = 2, x86_64 = 3), so the
 codes stay ordered armeabi-v7a < arm64-v8a < x86_64 as fdroiddata requires.
-For v2.1.6, base `2146` therefore produces codes `21461`/`21462`/`21463`.
+For v2.1.7, base `2147` therefore produces codes `21471`/`21472`/`21473`.
 CI reads the completed arm64 APK with `aapt` and fails if that relationship
 drifts. Release-floor checks continue to apply to the base value and must not
 be weakened to rely on the ABI code.
@@ -616,6 +641,10 @@ lib/
 
 ## Credits
 
+- **Thaeland** — contributed the extensive stock-gateway compatibility and
+  reliability work in PR #106: durable reconnect recovery, Projects and Chats
+  wire-contract fixes, safe pagination and folder ownership, transport
+  hardening, and the accompanying regression suite. Released in v2.1.7.
 - **spsDrop** — reported that Android could not connect through a private
   Caddy/Tailscale gateway whose CA was installed in the device trust store
   (#108). Fixed in v2.1.6.
