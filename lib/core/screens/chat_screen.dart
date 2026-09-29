@@ -295,6 +295,11 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
   static const _reattachRetryBaseDelay = Duration(milliseconds: 500);
   static const _reattachRetryMaxDelay = Duration(seconds: 30);
 
+  /// Backstop for [releaseClientAfterStreamSettles] on the dispose path: a
+  /// stream that never settles must not hold this screen's HTTP client open
+  /// for the life of the process.
+  static const _detachedStreamCloseDeadline = Duration(minutes: 30);
+
   /// Bumped every time authoritative history replaces [_messages]. The submit
   /// catch path compares it against the value captured at send time to tell
   /// whether a reattach resync already made the server history
@@ -457,7 +462,7 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
     for (final timer in _notificationTimers.values) {
       timer.cancel();
     }
-    _client.close();
+    _releaseClientAfterStreamSettles();
     unawaited(
       _attachmentDraftService.removeAll(
         List<AttachmentDraft>.from(_attachmentDrafts),
@@ -469,6 +474,32 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
     _scrollController.removeListener(_onScroll);
     _scrollController.dispose();
     super.dispose();
+  }
+
+  /// Closes this screen's HTTP client — but not while a turn is streaming.
+  ///
+  /// Closing the client aborts the in-flight SSE request, and the API server
+  /// treats a client disconnect as an agent interrupt ("SSE client
+  /// disconnected" → hard interrupt): the turn and every tool call it had made
+  /// were destroyed server-side, so leaving the chat mid-turn came back as a
+  /// bare `Operation interrupted.` with the work gone. Detach instead — the turn
+  /// finishes on the server, where the transcript is persisted anyway, and the
+  /// client closes as soon as the stream settles.
+  void _releaseClientAfterStreamSettles() {
+    final client = _client;
+    final gateway = _gateway;
+    if (!gateway.isStreaming) {
+      client.close();
+      return;
+    }
+    unawaited(
+      gateway
+          .whenStreamSettles()
+          // Backstop: a stream that never settles must not hold the client
+          // open for the life of the process.
+          .timeout(_detachedStreamCloseDeadline, onTimeout: () {})
+          .whenComplete(client.close),
+    );
   }
 
   @override

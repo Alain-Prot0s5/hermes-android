@@ -1102,9 +1102,40 @@ class GatewayChatClient {
     } catch (e) {
       if (!stream.cancelled) onError(e.toString());
     } finally {
+      // Every exit path settles this send, not just the ones that reach the
+      // SSE subscription. A `send()` that fails before the response headers, an
+      // abort that races the response, a non-200 reply, or an exception thrown
+      // while reading one never touch `completion`, yet such a send IS settled
+      // — the socket is finished with. Leaving the completer pending stranded a
+      // detached caller (screen disposal hands the stream to a closer that
+      // awaits exactly this) on the 30-minute backstop, holding the HTTP client
+      // open for a request that was already over.
+      if (!completion.isCompleted) completion.complete();
       if (identical(_liveStream, stream)) {
         _liveStream = null;
       }
+    }
+  }
+
+  /// Whether a send currently owns the live SSE stream.
+  bool get isStreaming => _liveStream != null;
+
+  /// Completes once the live stream settles: done, error, cancellation, or any
+  /// other exit from the send — including the failures that never open a body
+  /// stream (a rejected `send()`, a non-200 reply).
+  ///
+  /// Lets a caller that is going away hand the connection to a detached owner.
+  /// Closing the HTTP client while a turn streams aborts the request, and the
+  /// API server treats that client disconnect as an agent interrupt — the turn
+  /// and its tool work die server-side. A failed stream still counts as settled:
+  /// the caller's only need is for the socket to be finished with.
+  Future<void> whenStreamSettles() async {
+    final stream = _liveStream;
+    if (stream == null) return;
+    try {
+      await stream.completion.future;
+    } catch (_) {
+      // Settled with an error is settled.
     }
   }
 
