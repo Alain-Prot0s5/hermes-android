@@ -4,6 +4,22 @@ All notable changes to this project are documented here. This project adheres to
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html). Release notes for
 versions prior to 1.0.7 are in the **What's new** sections of the [README](README.md).
 
+## [2.1.8] - 2026-09-30
+
+### Fixed
+
+- HTTPS connections now honour an explicit Port field value, including `8642`;
+  scheme defaults are inferred only when the field is blank (#110, PR #111).
+- Leaving a chat during a running turn no longer closes its SSE connection and
+  interrupts the work server-side. Detached clients now remain open until the
+  stream settles, with failure and timeout paths still releasing them (#112,
+  PR #113).
+
+### Thanks
+
+- @igitur for diagnosing and fixing both connection-lifecycle issues and for
+  the comprehensive regression coverage in PRs #111 and #113.
+
 ## [2.1.7] - 2026-09-28
 
 ### Added

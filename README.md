@@ -1,4 +1,4 @@
-# Hermes Android — v2.1.7
+# Hermes Android — v2.1.8
 
 Android client for [Hermes Agent](https://hermes-agent.nousresearch.com/) — chat with your Hermes sessions from a phone or tablet over local Wi-Fi or a private Tailscale network.
 
@@ -14,7 +14,7 @@ Android client for [Hermes Agent](https://hermes-agent.nousresearch.com/) — ch
 
 ## Current release
 
-- Version: **2.1.7** (build 2147)
+- Version: **2.1.8** (build 2148)
 - Package: `com.hermesagent.hermes_android`
 - Recommended APK for modern phones: ARM64 release build from the
   [Releases](https://github.com/rusty4444/hermes-android/releases) page.
@@ -57,6 +57,19 @@ gateway explicitly advertises the compatible recovery contract.
 See [CHANGELOG.md](CHANGELOG.md) for the complete `.13` change list and
 [docs/HERMESAPK_DEVELOPMENT_LOG.md](docs/HERMESAPK_DEVELOPMENT_LOG.md) for the
 sanitized implementation and validation record.
+
+## What's new in v2.1.8
+
+v2.1.8 fixes two connection-lifecycle problems diagnosed and resolved by
+[@igitur](https://github.com/igitur) in PRs #111 and #113.
+
+- **Custom HTTPS ports work as entered** — an explicit Port field value is
+  honoured even when it is `8642`; leaving the field blank still infers `443`
+  for HTTPS and `8642` for HTTP.
+- **Turns survive leaving the chat** — navigating away during a running turn no
+  longer closes its SSE connection and interrupts the work server-side. The
+  detached client is released after completion, failure, cancellation, or its
+  safety timeout.
 
 ## What's new in v2.1.7
 
@@ -532,7 +545,7 @@ cp build/app/outputs/flutter-apk/app-*-release.apk release-apks/
 block in `android/app/build.gradle.kts` derives per-ABI codes as
 `base * 10 + ABI code` (armeabi-v7a = 1, arm64-v8a = 2, x86_64 = 3), so the
 codes stay ordered armeabi-v7a < arm64-v8a < x86_64 as fdroiddata requires.
-For v2.1.7, base `2147` therefore produces codes `21471`/`21472`/`21473`.
+For v2.1.8, base `2148` therefore produces codes `21481`/`21482`/`21483`.
 CI reads the completed arm64 APK with `aapt` and fails if that relationship
 drifts. Release-floor checks continue to apply to the base value and must not
 be weakened to rely on the ABI code.
@@ -643,6 +656,9 @@ lib/
 
 ## Credits
 
+- **igitur** — diagnosed and fixed explicit HTTPS port handling (PR #111) and
+  preserved running Hermes turns when leaving a chat (PR #113), with focused
+  regression coverage for both fixes. Released in v2.1.8.
 - **Thaeland** — contributed the extensive stock-gateway compatibility and
   reliability work in PR #106: durable reconnect recovery, Projects and Chats
   wire-contract fixes, safe pagination and folder ownership, transport
