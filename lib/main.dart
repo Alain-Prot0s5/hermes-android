@@ -1037,7 +1037,7 @@ class _AddDialog extends StatefulWidget {
   final Future<void> Function(
     String label,
     String host,
-    int port,
+    int? port,
     String apiKey, {
     String? gatewayPrefix,
     String? dashboardPrefix,
@@ -1086,7 +1086,7 @@ class _AddDialogState extends State<_AddDialog> {
           ? 'https://${conn.host}'
           : conn.host,
     );
-    _port = TextEditingController(text: (conn?.port ?? 8642).toString());
+    _port = TextEditingController(text: conn?.port.toString() ?? '');
     _apiKey = TextEditingController(text: conn?.apiKey ?? '');
     _gatewayPrefix = TextEditingController(text: conn?.gatewayPrefix ?? '');
     _dashboardPrefix = TextEditingController(text: conn?.dashboardPrefix ?? '');
@@ -1119,12 +1119,14 @@ class _AddDialogState extends State<_AddDialog> {
   Future<void> _validateAndSave() async {
     final label = _label.text.trim();
     final host = _host.text.trim();
-    final port = int.tryParse(_port.text.trim()) ?? 8642;
+    final port = int.tryParse(_port.text.trim());
     final apiKey = _apiKey.text.trim();
     final gatewayPrefix = _gatewayPrefix.text.trim();
     final dashboardPrefix = _dashboardPrefix.text.trim();
 
-    if (label.isEmpty || host.isEmpty || port <= 0) return;
+    // A blank Port field means "not supplied": normalizeHostAndPort then infers
+    // 8642 for HTTP and 443 for HTTPS.
+    if (label.isEmpty || host.isEmpty || (port != null && port <= 0)) return;
 
     setState(() {
       _validating = true;
@@ -1308,7 +1310,7 @@ class _AddDialogState extends State<_AddDialog> {
               controller: _port,
               decoration: const InputDecoration(
                 labelText: 'Port',
-                hintText: '8642 (API Server)',
+                hintText: 'Leave blank for default (8642; 443 with https)',
               ),
               keyboardType: TextInputType.number,
             ),
