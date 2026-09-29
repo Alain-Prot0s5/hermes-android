@@ -275,7 +275,7 @@ class ConnectionManager {
   Future<void> saveConnection(
     String label,
     String host,
-    int port,
+    int? port,
     String apiKey, {
     String? gatewayPrefix,
     String? dashboardPrefix,
@@ -323,7 +323,7 @@ class ConnectionManager {
     String connId,
     String label,
     String host,
-    int port,
+    int? port,
     String apiKey, {
     String? gatewayPrefix,
     String? dashboardPrefix,

@@ -275,13 +275,46 @@ void main() {
     });
 
     test('normalizes HTTPS URLs without an explicit port to 443', () {
+      // null = the Port field was left blank, i.e. no port supplied.
+      final normalized = SavedConnection.normalizeHostAndPort(
+        'https://hermes.example.com',
+        null,
+      );
+
+      expect(normalized.host, 'hermes.example.com');
+      expect(normalized.port, 443);
+      expect(normalized.useHttps, isTrue);
+    });
+
+    test('honours an explicit 8642 on an HTTPS host instead of 443', () {
       final normalized = SavedConnection.normalizeHostAndPort(
         'https://hermes.example.com',
         8642,
       );
 
       expect(normalized.host, 'hermes.example.com');
-      expect(normalized.port, 443);
+      expect(normalized.port, 8642);
+      expect(normalized.useHttps, isTrue);
+    });
+
+    test('infers 8642 for HTTP when no port is supplied', () {
+      final normalized = SavedConnection.normalizeHostAndPort(
+        'hermes.example.com',
+        null,
+      );
+
+      expect(normalized.host, 'hermes.example.com');
+      expect(normalized.port, 8642);
+      expect(normalized.useHttps, isFalse);
+    });
+
+    test('a port inside the URL still wins over the Port field', () {
+      final normalized = SavedConnection.normalizeHostAndPort(
+        'https://hermes.example.com:9443',
+        8642,
+      );
+
+      expect(normalized.port, 9443);
       expect(normalized.useHttps, isTrue);
     });
 
@@ -1780,7 +1813,7 @@ void main() {
           id,
           'Moved',
           'https://hermes.example.com',
-          8642,
+          null,
           'new-key',
           gatewayPrefix: '',
           dashboardPrefix: '',
@@ -1802,6 +1835,49 @@ void main() {
         expect(conn.dashboardPortOverride, isNull);
         expect(conn.dashboardUsername, isNull);
         expect(conn.dashboardPassword, isNull);
+      },
+    );
+
+    test(
+      'saveConnection keeps an explicit 8642 for an HTTPS host (issue #110)',
+      () async {
+        final prefs = await SharedPreferences.getInstance();
+        final mgr = await ConnectionManager.create(
+          prefs,
+          credentialStore: _MemoryCredentialStore(),
+        );
+        await mgr.saveConnection(
+          'kodi',
+          'https://home-kodi.example.ts.net',
+          8642,
+          'key',
+        );
+
+        final conn = mgr.getConnections().single;
+        expect(conn.port, 8642);
+        expect(conn.useHttps, isTrue);
+        expect(conn.baseUrl, 'https://home-kodi.example.ts.net:8642');
+      },
+    );
+
+    test(
+      'saveConnection infers 443 for HTTPS when the Port field is blank',
+      () async {
+        final prefs = await SharedPreferences.getInstance();
+        final mgr = await ConnectionManager.create(
+          prefs,
+          credentialStore: _MemoryCredentialStore(),
+        );
+        await mgr.saveConnection(
+          'proxy',
+          'https://hermes.example.com',
+          null,
+          'key',
+        );
+
+        final conn = mgr.getConnections().single;
+        expect(conn.port, 443);
+        expect(conn.useHttps, isTrue);
       },
     );
   });

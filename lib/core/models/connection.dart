@@ -99,19 +99,22 @@ class SavedConnection {
   /// When the user provides an explicit port inside the URL (e.g.
   /// `https://example.com:8443`) that port is always used.
   ///
-  /// When the URL has no explicit port, the [fallbackPort] is used.
-  /// Callers should set [fallbackPort] to the value typed by the user in the
-  /// Port field, so custom HTTPS ports (e.g. 8443) are preserved.
+  /// When the URL has no explicit port, [fallbackPort] is used. Callers should
+  /// pass the value typed by the user in the Port field, so custom ports (e.g.
+  /// 8443, or 8642 over HTTPS) are preserved. Pass `null` when the Port field is
+  /// blank: the scheme default is then inferred, `443` for HTTPS and `8642` for
+  /// HTTP.
   static NormalizedConnectionHost normalizeHostAndPort(
     String input,
-    int fallbackPort,
+    int? fallbackPort,
   ) {
     var raw = input.trim();
     final bool detectedHttps = raw.toLowerCase().startsWith('https://');
+    final int inferredPort = fallbackPort ?? (detectedHttps ? 443 : 8642);
     if (raw.isEmpty) {
       return NormalizedConnectionHost(
         host: raw,
-        port: fallbackPort,
+        port: inferredPort,
         useHttps: detectedHttps,
       );
     }
@@ -121,20 +124,14 @@ class SavedConnection {
     if (uri == null || uri.host.isEmpty) {
       return NormalizedConnectionHost(
         host: input.trim(),
-        port: fallbackPort,
+        port: inferredPort,
         useHttps: detectedHttps,
       );
     }
 
-    final normalizedPort = uri.hasPort
-        ? uri.port
-        : detectedHttps && fallbackPort == 8642
-        ? 443
-        : fallbackPort;
-
     return NormalizedConnectionHost(
       host: uri.host,
-      port: normalizedPort,
+      port: uri.hasPort ? uri.port : inferredPort,
       useHttps: detectedHttps || (uri.scheme == 'https'),
     );
   }
