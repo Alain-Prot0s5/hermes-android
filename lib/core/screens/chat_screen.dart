@@ -294,6 +294,7 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
   Timer? _reattachRetryTimer;
   static const _reattachRetryBaseDelay = Duration(milliseconds: 500);
   static const _reattachRetryMaxDelay = Duration(seconds: 30);
+  static const _historyPageSize = 50;
 
   /// Backstop for [releaseClientAfterStreamSettles] on the dispose path: a
   /// stream that never settles must not hold this screen's HTTP client open
@@ -672,7 +673,12 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
   }
 
   Future<void> _startVoiceInput() async {
-    if (_streaming || _sending || _loading || _pendingReattachResync) return;
+    if (_streaming ||
+        _sending ||
+        _transcriptLoadBlocksComposer ||
+        _pendingReattachResync) {
+      return;
+    }
     if (widget.testVoiceComposerAdapter == null) {
       await _flutterTts.stop();
     }
@@ -873,16 +879,22 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
 
   Future<void> _fetchMessages({String? sessionId}) async {
     if (_pendingReattachResync && sessionId == null) return;
+    final responseGeneration = _responseGeneration;
     setState(() {
       _loading = true;
       _error = null;
     });
 
     try {
-      final messages = await _client.getMessages(
-        sessionId ?? widget.session.id,
-      );
+      final messages = await _getRecentMessages(sessionId ?? widget.session.id);
       if (!mounted) return;
+      // A remote turn can start while history is still hydrating. Its local
+      // optimistic messages and stream are newer than this response, so never
+      // replace them with a stale transcript page.
+      if (responseGeneration != _responseGeneration) {
+        setState(() => _loading = false);
+        return;
+      }
       _extractToolMessages(messages);
       final completedPendingReattach =
           _pendingReattachResync &&
@@ -898,6 +910,10 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
       if (completedPendingReattach) _clearPendingReattachResync();
     } catch (e) {
       if (!mounted) return;
+      if (responseGeneration != _responseGeneration) {
+        setState(() => _loading = false);
+        return;
+      }
       final errStr = e.toString();
       if (errStr.contains('404') || errStr.contains('not found')) {
         if (_pendingReattachResync) {
@@ -918,6 +934,9 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
       });
     }
   }
+
+  Future<List<Map<String, dynamic>>> _getRecentMessages(String sessionId) =>
+      _client.getMessages(sessionId, limit: _historyPageSize, latest: true);
 
   /// Reattach resync: the socket came back after a mid-turn drop. Re-bind
   /// the session on the fresh socket (single-flights with the client's own
@@ -1092,7 +1111,7 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
           _desktopGateway?.storedSessionKeyFor(widget.session.id) ??
           widget.testStoredSessionKey?.call(widget.session.id) ??
           widget.session.id;
-      final messages = await _client.getMessages(storedSessionId);
+      final messages = await _getRecentMessages(storedSessionId);
       if (!_canRunReattachResync || generation != _reattachGeneration) return;
       _extractToolMessages(messages);
       final completed = _hasTerminalAssistantAfterWatermark(messages);
@@ -1142,7 +1161,7 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
 
     _legacyHistoryResyncing = true;
     try {
-      final messages = await _client.getMessages(widget.session.id);
+      final messages = await _getRecentMessages(widget.session.id);
       if (!mounted || _appInBackground) return;
       _extractToolMessages(messages);
       setState(() {
@@ -1359,7 +1378,12 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
   }
 
   Future<void> _showAttachmentPicker() async {
-    if (_loading || _streaming || _sending || _pendingReattachResync) return;
+    if (_transcriptLoadBlocksComposer ||
+        _streaming ||
+        _sending ||
+        _pendingReattachResync) {
+      return;
+    }
 
     await showModalBottomSheet<void>(
       context: context,
@@ -1952,6 +1976,15 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
     final attachments = List<AttachmentDraft>.from(_attachmentDrafts);
     if (text.isEmpty && attachments.isEmpty) return;
     if (_sending || _streaming || _pendingReattachResync) return;
+    if (_transcriptLoadBlocksComposer) return;
+    if (_loading || _error != null) {
+      // Remote transports own their session history server-side. Let a prompt
+      // proceed independently of a slow or failed visible transcript request.
+      setState(() {
+        _loading = false;
+        _error = null;
+      });
+    }
     await _sessionModelRestore;
     if (!mounted) return;
 
@@ -2062,7 +2095,7 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
         if (!mounted || responseGeneration != _responseGeneration) return;
         // Refresh messages to get the final server-side state
         try {
-          final messages = await _client.getMessages(widget.session.id);
+          final messages = await _getRecentMessages(widget.session.id);
           if (!mounted || responseGeneration != _responseGeneration) return;
           _extractToolMessages(messages);
           if (pendingImage != null) {
@@ -3121,6 +3154,12 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
     _scheduleStreamingFollow();
   }
 
+  bool get _transcriptLoadBlocksComposer =>
+      _loading &&
+      _desktopGateway == null &&
+      _turnApplicationSession == null &&
+      widget.testRemotePromptSubmit == null;
+
   ChatConnectionStatus get _chatConnectionStatus {
     if (_desktopGateway == null) {
       if (_loading) return ChatConnectionStatus.connecting;
@@ -3420,7 +3459,7 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
                   label: 'Add attachment',
                   button: true,
                   enabled:
-                      !_loading &&
+                      !_transcriptLoadBlocksComposer &&
                       !_streaming &&
                       !_sending &&
                       !_pendingReattachResync,
@@ -3428,7 +3467,7 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
                   child: IconButton(
                     icon: const Icon(Icons.attach_file),
                     onPressed:
-                        (!_loading &&
+                        (!_transcriptLoadBlocksComposer &&
                             !_streaming &&
                             !_sending &&
                             !_pendingReattachResync)
@@ -3465,7 +3504,9 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
                       keyboardType: TextInputType.multiline,
                       textInputAction: TextInputAction.send,
                       enabled:
-                          !_loading && !_streaming && !_pendingReattachResync,
+                          !_transcriptLoadBlocksComposer &&
+                          !_streaming &&
+                          !_pendingReattachResync,
                       onSubmitted: (_) => _sendMessage(),
                     ),
                   ),
@@ -3474,7 +3515,7 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
                 if (!_voiceComposer.listening)
                   VoiceComposerStartButton(
                     enabled:
-                        !_loading &&
+                        !_transcriptLoadBlocksComposer &&
                         !_streaming &&
                         !_sending &&
                         !_pendingReattachResync,
@@ -3511,7 +3552,7 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
                   button: true,
                   enabled:
                       _streaming ||
-                      (!_loading &&
+                      (!_transcriptLoadBlocksComposer &&
                           !_sending &&
                           !_pendingReattachResync &&
                           !_voiceComposer.listening),
@@ -3536,7 +3577,7 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
                           : IconButton(
                               icon: const Icon(Icons.send, size: 20),
                               onPressed:
-                                  _loading ||
+                                  _transcriptLoadBlocksComposer ||
                                       _sending ||
                                       _pendingReattachResync ||
                                       _voiceComposer.listening
