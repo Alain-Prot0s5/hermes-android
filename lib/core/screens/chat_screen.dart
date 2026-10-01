@@ -2743,7 +2743,12 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
     _activeApprovalServerRequestId = serverRequestId;
 
     WidgetsBinding.instance.addPostFrameCallback((_) async {
-      if (!mounted || responseGeneration != _responseGeneration) {
+      final wasCancelledBeforeOpen =
+          serverRequestId != null &&
+          _cancelledInteractiveRequestIds.remove(serverRequestId);
+      if (!mounted ||
+          responseGeneration != _responseGeneration ||
+          wasCancelledBeforeOpen) {
         _approvalDialogOpen = false;
         _activeApprovalServerRequestId = null;
         return;
@@ -2992,6 +2997,7 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
     WidgetsBinding.instance.addPostFrameCallback((_) async {
       if (!mounted ||
           pending.responseGeneration != _responseGeneration ||
+          _cancelledInteractiveRequestIds.remove(pending.request.requestId) ||
           _activeClarifyPrompt?.request.identityKey !=
               pending.request.identityKey) {
         _activeClarifyPrompt = null;

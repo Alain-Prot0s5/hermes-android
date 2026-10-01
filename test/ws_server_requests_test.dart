@@ -65,6 +65,8 @@ void main() {
       );
       addTearDown(client.close);
       await client.connect().timeout(const Duration(seconds: 5));
+      await Future<void>.delayed(const Duration(milliseconds: 50));
+      expect(gateway.capabilityFrames, isEmpty);
 
       gateway.sendServerRequest(
         id: 'srq-unknown',
@@ -256,6 +258,69 @@ void main() {
       );
       expect(gateway.serverResponses['srq-resumed-secret']?['result'], {
         'value': 'value',
+      });
+    },
+  );
+
+  test(
+    'Desktop bridge does not replay already locked clarify answers',
+    () async {
+      final gateway = await _ServerRequestGateway.start(
+        withDashboardAuth: true,
+        openRequestsOnResume: [
+          {
+            'id': 'srq-resumed-clarify',
+            'method': 'clarify',
+            'params': {
+              'session_id': 'runtime-1',
+              'questions': [
+                {'qid': 'q1', 'question': 'Already answered?'},
+                {'qid': 'q2', 'question': 'Still pending?'},
+              ],
+              'answers': {'q1': 'Yes'},
+            },
+          },
+        ],
+      );
+      addTearDown(gateway.stop);
+      final client = DesktopGatewayClient.fromConnection(
+        SavedConnection(
+          id: 'server-request-clarify-replay-test',
+          label: 'Local fixture',
+          host: 'localhost',
+          port: gateway.port,
+          apiKey: 'fixture-key',
+          useHttps: false,
+          desktopGatewayUrl: 'http://127.0.0.1:${gateway.port}',
+          dashboardUsername: 'user',
+          dashboardPassword: 'pass',
+        ),
+      );
+      addTearDown(client.close);
+      final events = <StreamEvent>[];
+      client.setAsyncEventListener((_, event) => events.add(event));
+
+      await client.ensureSession('stored-1');
+      await _waitFor(
+        () => events.any((event) => event.type == 'clarify.request'),
+      );
+      final event = events.lastWhere(
+        (candidate) => candidate.type == 'clarify.request',
+      );
+      expect(event.data['questions'], [
+        {'qid': 'q2', 'question': 'Still pending?'},
+      ]);
+
+      await client.respondToClarify(
+        requestId: 'srq-resumed-clarify',
+        questionId: 'q2',
+        answer: 'No',
+      );
+      await _waitFor(() => gateway.clarifyLocks.isNotEmpty);
+      expect(gateway.clarifyLocks.single, {
+        'request_id': 'srq-resumed-clarify',
+        'question_id': 'q2',
+        'answer': 'No',
       });
     },
   );

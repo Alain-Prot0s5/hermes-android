@@ -584,7 +584,10 @@ class WsClient {
   }
 
   void _advertiseServerRequestSupport() {
-    if (_serverRequestsAdvertised) return;
+    // Never claim support unless this socket can actually route the requests.
+    // A recovery socket without a handler would otherwise make the gateway
+    // send prompts that this client immediately rejects with -32601.
+    if (_serverRequestsAdvertised || onServerRequest == null) return;
     _serverRequestsAdvertised = true;
     // This method is connection-scoped, not profile-scoped. Older gateways
     // answer -32601; deliberately ignore that response so they keep working.
@@ -1037,6 +1040,7 @@ class WsClient {
     required String requestId,
     required String answer,
     String? questionId,
+    bool lockAnswer = false,
   }) async {
     if (requestId.trim().isEmpty) {
       throw ArgumentError.value(
@@ -1050,7 +1054,10 @@ class WsClient {
     if (hasQuestionId) {
       params['question_id'] = questionId;
     }
-    final method = hasQuestionId ? 'clarify.lock' : 'clarify.respond';
+    if (lockAnswer && !hasQuestionId) {
+      throw ArgumentError('questionId is required to lock a clarify answer');
+    }
+    final method = lockAnswer ? 'clarify.lock' : 'clarify.respond';
     final response = await send(method, params);
     final error = response['error'];
     if (error != null) {

@@ -3432,6 +3432,7 @@ void main() {
         await client.connect();
         await client.respondToClarify(
           requestId: 'clarify-request-123',
+          questionId: 'q1',
           answer: 'Balanced',
         );
         final request = await requestSeen.future;
@@ -3439,6 +3440,7 @@ void main() {
         expect(request['method'], 'clarify.respond');
         expect(request['params'], {
           'request_id': 'clarify-request-123',
+          'question_id': 'q1',
           'answer': 'Balanced',
         });
       } finally {
@@ -3474,6 +3476,7 @@ void main() {
           requestId: 'clarify-request-123',
           questionId: 'q1',
           answer: 'Balanced',
+          lockAnswer: true,
         );
         final request = await requestSeen.future;
 

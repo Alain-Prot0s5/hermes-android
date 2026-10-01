@@ -563,15 +563,25 @@ class DesktopGatewayClient {
   GatewayTurnCoordinatorRegistry enableTurnRecoveryCoordinator({
     GatewayTurnJournal? journal,
   }) {
-    return _turnCoordinatorRegistry ??= GatewayTurnCoordinatorRegistry(
-      connectionId: _connectionId,
-      endpointDigest: _endpointDigest(_baseUrl),
-      journal: journal ?? GatewayTurnJournal(),
-      freshSocketFactory: () async {
-        final ticket = await _dashboard.mintWebSocketTicket();
-        return WsClient(_baseUrl, ticket: ticket, profile: _gatewayProfile);
-      },
-    );
+    return _turnCoordinatorRegistry ??=
+        GatewayTurnCoordinatorRegistry(
+            connectionId: _connectionId,
+            endpointDigest: _endpointDigest(_baseUrl),
+            journal: journal ?? GatewayTurnJournal(),
+            freshSocketFactory: () async {
+              final ticket = await _dashboard.mintWebSocketTicket();
+              final client = WsClient(
+                _baseUrl,
+                ticket: ticket,
+                profile: _gatewayProfile,
+              );
+              _installAsyncEventBridge(client);
+              return client;
+            },
+          )
+          ..onRuntimeBound = (localSessionId, runtimeSessionId) {
+            _gatewaySessionIds[localSessionId] = runtimeSessionId;
+          };
   }
 
   void setConnectionListener(DesktopConnectionCallback? listener) {
@@ -665,18 +675,26 @@ class DesktopGatewayClient {
     if (request.method == 'clarify') {
       data['request_id'] = request.id;
       final questions = data['questions'];
+      final lockedAnswers = data['answers'];
+      final lockedQuestionIds = lockedAnswers is Map
+          ? lockedAnswers.keys.map((key) => key.toString()).toSet()
+          : const <String>{};
       final qids = <String>{};
+      final remainingQuestions = <dynamic>[];
       if (questions is List) {
         for (final raw in questions) {
           if (raw is! Map) continue;
           final qid = raw['qid']?.toString().trim() ?? '';
-          if (qid.isNotEmpty) qids.add(qid);
+          if (qid.isEmpty || lockedQuestionIds.contains(qid)) continue;
+          qids.add(qid);
+          remainingQuestions.add(raw);
         }
       }
       if (qids.isEmpty) {
         _serverRequests.remove(request.id);
         return false;
       }
+      data['questions'] = remainingQuestions;
       _serverClarifyRemaining[request.id] = qids;
     } else if (request.method == 'approval') {
       _serverApprovalByMobileSession[mobileSessionId] = request.id;
@@ -782,6 +800,7 @@ class DesktopGatewayClient {
         requestId: requestId,
         answer: answer,
         questionId: qid,
+        lockAnswer: true,
       );
       final remaining = _serverClarifyRemaining[requestId];
       remaining?.remove(qid);

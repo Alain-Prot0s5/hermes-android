@@ -622,7 +622,62 @@ void _expectPayloadFreePoison(GatewayTurnRecoveryState? failure) {
   expect(failure.snapshot, isNull);
 }
 
+Future<void> _waitFor(
+  bool Function() condition, {
+  Duration timeout = const Duration(seconds: 5),
+}) async {
+  final deadline = DateTime.now().add(timeout);
+  while (!condition()) {
+    if (DateTime.now().isAfter(deadline)) {
+      throw StateError('condition not met within $timeout');
+    }
+    await Future<void>.delayed(const Duration(milliseconds: 20));
+  }
+}
+
 void main() {
+  test(
+    'coordinator reports runtime binding and preserves inherited events',
+    () async {
+      final fixture = await _GatewayFixture.start();
+      addTearDown(fixture.close);
+      final inheritedEvents = <StreamEvent>[];
+      final runtimeBindings = <String, String>{};
+      final coordinator =
+          GatewayTurnCoordinator(
+              connectionId: 'connection-a',
+              endpointDigest: _digest,
+              localSessionId: 'local-a',
+              journal: GatewayTurnJournal(store: _MemoryJournalStore()),
+              freshSocketFactory: () async {
+                final client = WsClient(fixture.baseUrl);
+                client.onStreamEvent = inheritedEvents.add;
+                return client;
+              },
+              uuidFactory: () => _clientA,
+              clock: () => DateTime.fromMillisecondsSinceEpoch(
+                _baseMs + 1000,
+                isUtc: true,
+              ),
+            )
+            ..onRuntimeBound = (localSessionId, runtimeSessionId) {
+              runtimeBindings[localSessionId] = runtimeSessionId;
+            };
+      addTearDown(coordinator.close);
+
+      await coordinator.ensureOpen();
+      expect(runtimeBindings, {'local-a': 'runtime-1'});
+
+      fixture.sendEvent({
+        'type': 'request.cancel',
+        'session_id': 'runtime-1',
+        'payload': {'id': 'srq-1', 'method': 'clarify'},
+      });
+      await _waitFor(() => inheritedEvents.isNotEmpty);
+      expect(inheritedEvents.single.type, 'request.cancel');
+    },
+  );
+
   group('GatewayTurnRecoveryState rehydrate', () {
     test('accepts unresolved and known nonterminal durable states', () {
       final unresolved = GatewayTurnRecoveryState.rehydrate(
