@@ -151,6 +151,11 @@ class _GatewayFixture {
       socket.listen(
         (raw) async {
           final request = jsonDecode(raw as String) as Map<String, dynamic>;
+          // WsClient negotiates interactive server requests for every socket.
+          // This fixture exercises turn recovery, so exclude that independent,
+          // best-effort negotiation from turn request assertions. Dedicated
+          // transport tests cover its response contract.
+          if (request['method'] == 'client.capabilities') return;
           requests.add(request);
           order.add(request['method'] as String);
           final result = await (handler == null
@@ -2242,50 +2247,41 @@ void main() {
       },
     );
 
-    test(
-      'v2 protocol without turn_recovery is also a clean absence',
-      () async {
-        final ready = _readyFrame();
-        final payload =
-            (ready['params'] as Map<String, dynamic>)['payload']
-                as Map<String, dynamic>;
-        (payload['capabilities'] as Map<String, dynamic>).remove(
-          'turn_recovery',
-        );
-        final fixture = await _GatewayFixture.start(
-          readyFrame: ready,
-          handler: (request, _) => throw StateError(
-            'Unsupported ready must not call ${request['method']}',
+    test('v2 protocol without turn_recovery is also a clean absence', () async {
+      final ready = _readyFrame();
+      final payload =
+          (ready['params'] as Map<String, dynamic>)['payload']
+              as Map<String, dynamic>;
+      (payload['capabilities'] as Map<String, dynamic>).remove('turn_recovery');
+      final fixture = await _GatewayFixture.start(
+        readyFrame: ready,
+        handler: (request, _) => throw StateError(
+          'Unsupported ready must not call ${request['method']}',
+        ),
+      );
+      final coordinator = _coordinator(
+        fixture: fixture,
+        journal: GatewayTurnJournal(store: _MemoryJournalStore()),
+      );
+
+      try {
+        await expectLater(
+          coordinator.recoverPending(),
+          throwsA(
+            isA<GatewayTurnCoordinatorException>()
+                .having(
+                  (error) => error.failure,
+                  'failure',
+                  GatewayTurnCoordinatorFailure.unsupportedCapability,
+                )
+                .having((error) => error.stockGateway, 'stockGateway', isTrue),
           ),
         );
-        final coordinator = _coordinator(
-          fixture: fixture,
-          journal: GatewayTurnJournal(store: _MemoryJournalStore()),
-        );
-
-        try {
-          await expectLater(
-            coordinator.recoverPending(),
-            throwsA(
-              isA<GatewayTurnCoordinatorException>()
-                  .having(
-                    (error) => error.failure,
-                    'failure',
-                    GatewayTurnCoordinatorFailure.unsupportedCapability,
-                  )
-                  .having(
-                    (error) => error.stockGateway,
-                    'stockGateway',
-                    isTrue,
-                  ),
-            ),
-          );
-        } finally {
-          await coordinator.close();
-          await fixture.close();
-        }
-      },
-    );
+      } finally {
+        await coordinator.close();
+        await fixture.close();
+      }
+    });
 
     test(
       'a wrong protocol name is a mismatch, never a clean absence',
@@ -2294,8 +2290,7 @@ void main() {
         final payload =
             (ready['params'] as Map<String, dynamic>)['payload']
                 as Map<String, dynamic>;
-        (payload['protocol'] as Map<String, dynamic>)['name'] =
-            'not-hermes';
+        (payload['protocol'] as Map<String, dynamic>)['name'] = 'not-hermes';
         final fixture = await _GatewayFixture.start(
           readyFrame: ready,
           handler: (request, _) => throw StateError(
