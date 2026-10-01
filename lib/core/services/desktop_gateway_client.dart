@@ -44,6 +44,9 @@ class DesktopGatewayClient {
   final Map<String, String> _gatewaySessionIds = {};
   final Map<String, String> _storedSessionIds = {};
   final Map<String, String> _workingDirectories = {};
+  final Map<String, GatewayServerRequest> _serverRequests = {};
+  final Map<String, Set<String>> _serverClarifyRemaining = {};
+  final Map<String, String> _serverApprovalByMobileSession = {};
   DesktopAsyncEventCallback? _asyncEventListener;
   DesktopConnectionCallback? _connectionListener;
   GatewayTurnCoordinatorRegistry? _turnCoordinatorRegistry;
@@ -68,6 +71,7 @@ class DesktopGatewayClient {
     'turn.end',
     'turn.error',
     'error',
+    'request.cancel',
   };
 
   DesktopGatewayClient._({
@@ -254,6 +258,9 @@ class DesktopGatewayClient {
     );
     existing?.close();
     _gatewaySessionIds.clear();
+    _serverRequests.clear();
+    _serverClarifyRemaining.clear();
+    _serverApprovalByMobileSession.clear();
     // A fresh socket means a possibly-replaced server: forget old
     // -32601 verdicts so an upgraded gateway's methods are re-discovered
     // instead of staying short-circuited until app restart. gateway.ready
@@ -407,6 +414,11 @@ class DesktopGatewayClient {
     _gatewaySessionIds[mobileSessionId] = binding.runtimeSessionId;
     _storedSessionIds[mobileSessionId] = binding.storedSessionId;
     final resumed = binding.resumed;
+    if (resumed != null && resumed.openRequests.isNotEmpty) {
+      // The resume payload carries unanswered server→client requests. Deliver
+      // only after the runtime sid is mapped back to this mobile chat.
+      _ws?.deliverOpenRequests(resumed.openRequests);
+    }
     final inflight = resumed?.inflight;
     final error = inflight?['error']?.toString().trim() ?? '';
     final status = (inflight?['status'] ?? resumed?.status)
@@ -612,23 +624,83 @@ class DesktopGatewayClient {
     // Every socket greets us with gateway.ready; that greeting is where the
     // capability registry learns what this Hermes instance offers.
     _capabilities.bindTo(client);
+    client.onServerRequest = _handleServerRequest;
     client.onStreamEvent = (event) {
       if (!_asyncEventTypes.contains(event.type)) return;
-      final gatewaySessionId = event.data['session_id']?.toString();
-      String? mobileSessionId;
-      if (gatewaySessionId != null && gatewaySessionId.isNotEmpty) {
-        for (final entry in _gatewaySessionIds.entries) {
-          if (entry.value == gatewaySessionId) {
-            mobileSessionId = entry.key;
-            break;
-          }
-        }
-      } else if (_gatewaySessionIds.length == 1) {
-        mobileSessionId = _gatewaySessionIds.keys.single;
+      if (event.type == 'request.cancel') {
+        final requestId = event.data['id']?.toString() ?? '';
+        if (requestId.isNotEmpty) _forgetServerRequest(requestId);
       }
+      final mobileSessionId = _mobileSessionIdFor(
+        event.data['session_id']?.toString(),
+      );
       if (mobileSessionId == null) return;
       _asyncEventListener?.call(mobileSessionId, event);
     };
+  }
+
+  String? _mobileSessionIdFor(String? gatewaySessionId) {
+    if (gatewaySessionId != null && gatewaySessionId.isNotEmpty) {
+      for (final entry in _gatewaySessionIds.entries) {
+        if (entry.value == gatewaySessionId) return entry.key;
+      }
+    } else if (_gatewaySessionIds.length == 1) {
+      return _gatewaySessionIds.keys.single;
+    }
+    return null;
+  }
+
+  bool _handleServerRequest(GatewayServerRequest request) {
+    const supported = {'clarify', 'approval', 'sudo', 'secret'};
+    if (!supported.contains(request.method)) return false;
+
+    final gatewaySessionId = request.params['session_id']?.toString();
+    final mobileSessionId = _mobileSessionIdFor(gatewaySessionId);
+    if (mobileSessionId == null || _asyncEventListener == null) return false;
+
+    _serverRequests[request.id] = request;
+    final data = Map<String, dynamic>.from(request.params);
+    data['server_request_id'] = request.id;
+
+    if (request.method == 'clarify') {
+      data['request_id'] = request.id;
+      final questions = data['questions'];
+      final qids = <String>{};
+      if (questions is List) {
+        for (final raw in questions) {
+          if (raw is! Map) continue;
+          final qid = raw['qid']?.toString().trim() ?? '';
+          if (qid.isNotEmpty) qids.add(qid);
+        }
+      }
+      if (qids.isEmpty) {
+        _serverRequests.remove(request.id);
+        return false;
+      }
+      _serverClarifyRemaining[request.id] = qids;
+    } else if (request.method == 'approval') {
+      _serverApprovalByMobileSession[mobileSessionId] = request.id;
+    } else {
+      // Legacy event models key sensitive prompts by `request_id`; for the
+      // peer-to-peer protocol the JSON-RPC id is the response correlation.
+      data['request_id'] = request.id;
+    }
+
+    _asyncEventListener!.call(
+      mobileSessionId,
+      StreamEvent(
+        type: '${request.method}.request',
+        data: data,
+        sessionId: gatewaySessionId,
+      ),
+    );
+    return true;
+  }
+
+  void _forgetServerRequest(String requestId) {
+    _serverRequests.remove(requestId);
+    _serverClarifyRemaining.remove(requestId);
+    _serverApprovalByMobileSession.removeWhere((_, id) => id == requestId);
   }
 
   /// Interrupts the active turn in the Desktop gateway runtime.
@@ -648,6 +720,14 @@ class DesktopGatewayClient {
     required String sessionId,
     required String choice,
   }) async {
+    final serverRequestId = _serverApprovalByMobileSession.remove(sessionId);
+    final serverRequest = serverRequestId == null
+        ? null
+        : _serverRequests.remove(serverRequestId);
+    if (serverRequest != null) {
+      serverRequest.respond({'choice': choice});
+      return;
+    }
     final gatewaySessionId = _gatewaySessionIds[sessionId];
     final client = _ws;
     if (gatewaySessionId == null || client == null || !client.isConnected) {
@@ -660,6 +740,12 @@ class DesktopGatewayClient {
     required String requestId,
     required String password,
   }) async {
+    final serverRequest = _serverRequests[requestId];
+    if (serverRequest?.method == 'sudo') {
+      _forgetServerRequest(requestId);
+      serverRequest!.respond({'value': password});
+      return;
+    }
     final client = _connectedClient();
     await client.respondToSudo(requestId: requestId, password: password);
   }
@@ -668,6 +754,12 @@ class DesktopGatewayClient {
     required String requestId,
     required String value,
   }) async {
+    final serverRequest = _serverRequests[requestId];
+    if (serverRequest?.method == 'secret') {
+      _forgetServerRequest(requestId);
+      serverRequest!.respond({'value': value});
+      return;
+    }
     final client = _connectedClient();
     await client.respondToSecret(requestId: requestId, value: value);
   }
@@ -678,6 +770,26 @@ class DesktopGatewayClient {
     String? questionId,
   }) async {
     final client = _connectedClient();
+    final serverRequest = _serverRequests[requestId];
+    if (serverRequest?.method == 'clarify') {
+      final qid = questionId?.trim() ?? '';
+      if (qid.isEmpty) {
+        throw ArgumentError('questionId is required for a clarify request');
+      }
+      // Current Hermes locks each batch answer through clarify.lock; the last
+      // lock resolves the original server request on the backend.
+      await client.respondToClarify(
+        requestId: requestId,
+        answer: answer,
+        questionId: qid,
+      );
+      final remaining = _serverClarifyRemaining[requestId];
+      remaining?.remove(qid);
+      if (remaining == null || remaining.isEmpty) {
+        _forgetServerRequest(requestId);
+      }
+      return;
+    }
     await client.respondToClarify(
       requestId: requestId,
       answer: answer,
@@ -768,6 +880,9 @@ class DesktopGatewayClient {
     _gatewaySessionIds.clear();
     _storedSessionIds.clear();
     _workingDirectories.clear();
+    _serverRequests.clear();
+    _serverClarifyRemaining.clear();
+    _serverApprovalByMobileSession.clear();
     final turnCoordinatorRegistry = _turnCoordinatorRegistry;
     _turnCoordinatorRegistry = null;
     if (turnCoordinatorRegistry != null) {

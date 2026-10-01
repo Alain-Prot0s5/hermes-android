@@ -169,18 +169,57 @@ class ResumedGatewaySession {
   final bool? running;
   final String? status;
   final Map<String, dynamic>? inflight;
+  final List<dynamic> openRequests;
 
   const ResumedGatewaySession({
     required this.runtimeSessionId,
     this.running,
     this.status,
     this.inflight,
+    this.openRequests = const [],
   });
 }
 
 typedef StreamCallback = void Function(StreamEvent event);
 typedef ConnectionCallback = void Function(bool connected);
 typedef GatewayReadyCallback = void Function(Map<String, dynamic> frame);
+typedef ServerRequestCallback = bool Function(GatewayServerRequest request);
+
+/// A JSON-RPC request initiated by the Hermes gateway.
+///
+/// Unlike an `event` notification, this frame carries a string request ID and
+/// must be answered with a JSON-RPC response carrying that same ID. The first
+/// [respond] or [fail] call wins so a replayed card cannot answer twice.
+class GatewayServerRequest {
+  final String id;
+  final String method;
+  final Map<String, dynamic> params;
+  final bool replayed;
+  final void Function(Map<String, dynamic> result) _respond;
+  final void Function(int code, String message) _fail;
+  bool _settled = false;
+
+  GatewayServerRequest._({
+    required this.id,
+    required this.method,
+    required this.params,
+    required this.replayed,
+    required this._respond,
+    required this._fail,
+  });
+
+  void respond(Map<String, dynamic> result) {
+    if (_settled) return;
+    _settled = true;
+    _respond(result);
+  }
+
+  void fail(int code, String message) {
+    if (_settled) return;
+    _settled = true;
+    _fail(code, message);
+  }
+}
 
 /// WebSocket client for the Hermes JSON-RPC gateway.
 class WsClient {
@@ -209,9 +248,11 @@ class WsClient {
   Map<String, dynamic>? _gatewayReadyFrame;
   String? _gatewayReadyCanonical;
   JsonRpcError? _gatewayReadyFailure;
+  bool _serverRequestsAdvertised = false;
 
   /// Global stream listener (receives all untargeted events).
   StreamCallback? onStreamEvent;
+  ServerRequestCallback? onServerRequest;
   ConnectionCallback? onConnectionChanged;
   GatewayReadyCallback? onGatewayReady;
 
@@ -264,6 +305,7 @@ class WsClient {
     _gatewayReadyFrame = null;
     _gatewayReadyCanonical = null;
     _gatewayReadyFailure = null;
+    _serverRequestsAdvertised = false;
     final readyCompleter = Completer<Map<String, dynamic>>();
     _gatewayReadyCompleter = readyCompleter;
     // A transport can close before a caller starts waiting for gateway.ready.
@@ -488,11 +530,25 @@ class WsClient {
       final method = data['method'] as String?;
       final params = data['params'];
 
+      // JSON-RPC is peer-to-peer. Hermes uses string IDs (`srq-...`) for
+      // server→client requests so they cannot collide with our integer IDs.
+      // Route these before the normal response path; treating them as an
+      // unknown response silently drops clarify/approval/secret prompts.
+      if (id is String && method != null && method != 'event') {
+        _deliverServerRequest(
+          id,
+          method,
+          params is Map<String, dynamic> ? params : const {},
+        );
+        return;
+      }
+
       // Server-pushed events have the JSON-RPC method `event` and carry their
       // actual type/session/payload inside params.
       if (method == 'event' && id == null && params is Map<String, dynamic>) {
         if (params['type'] == 'gateway.ready') {
           _handleGatewayReady(data, generation);
+          _advertiseServerRequestSupport();
           return;
         }
         final event = parseGatewayEvent(params);
@@ -525,6 +581,82 @@ class WsClient {
     } catch (_) {
       // Ignore parse errors
     }
+  }
+
+  void _advertiseServerRequestSupport() {
+    if (_serverRequestsAdvertised) return;
+    _serverRequestsAdvertised = true;
+    // This method is connection-scoped, not profile-scoped. Older gateways
+    // answer -32601; deliberately ignore that response so they keep working.
+    unawaited(
+      send('client.capabilities', const {
+        'server_requests': true,
+      }, includeProfile: false).then<void>((_) {}, onError: (_, _) {}),
+    );
+  }
+
+  void _deliverServerRequest(
+    String id,
+    String method,
+    Map<String, dynamic> params, {
+    bool replayed = false,
+  }) {
+    final request = GatewayServerRequest._(
+      id: id,
+      method: method,
+      params: Map<String, dynamic>.from(params),
+      replayed: replayed,
+      respond: (result) => _sendServerResponse(id, result: result),
+      fail: (code, message) =>
+          _sendServerResponse(id, error: {'code': code, 'message': message}),
+    );
+    final listener = onServerRequest;
+    if (listener == null) {
+      request.fail(-32601, 'no handler for server request: $method');
+      return;
+    }
+    try {
+      if (!listener(request)) {
+        request.fail(-32601, 'no handler for server request: $method');
+      }
+    } catch (_) {
+      request.fail(-32603, 'server request handler crashed: $method');
+    }
+  }
+
+  /// Re-deliver unanswered requests returned by `session.resume` or event
+  /// replay after the caller has restored its runtime-to-local session map.
+  void deliverOpenRequests(Iterable<dynamic> snapshots) {
+    for (final raw in snapshots) {
+      if (raw is! Map) continue;
+      final entry = Map<String, dynamic>.from(raw);
+      final id = entry['id'];
+      final method = entry['method'];
+      final rawParams = entry['params'];
+      if (id is! String || method is! String) continue;
+      _deliverServerRequest(
+        id,
+        method,
+        rawParams is Map ? Map<String, dynamic>.from(rawParams) : const {},
+        replayed: true,
+      );
+    }
+  }
+
+  void _sendServerResponse(
+    String id, {
+    Map<String, dynamic>? result,
+    Map<String, dynamic>? error,
+  }) {
+    final channel = _channel;
+    if (channel == null || channel.closeCode != null) return;
+    channel.sink.add(
+      jsonEncode({
+        'jsonrpc': '2.0',
+        'id': id,
+        if (error != null) 'error': error else 'result': result ?? const {},
+      }),
+    );
   }
 
   void _handleGatewayReady(Map<String, dynamic> data, int generation) {
@@ -678,6 +810,7 @@ class WsClient {
     Map<String, dynamic> params, {
     Duration timeout = const Duration(seconds: 30),
     void Function()? onSent,
+    bool includeProfile = true,
   }) async {
     if (!_connected || _channel == null) {
       throw Exception('Not connected');
@@ -698,7 +831,7 @@ class WsClient {
         jsonEncode({
           'jsonrpc': '2.0',
           'method': method,
-          'params': withProfile(params, _profile),
+          'params': includeProfile ? withProfile(params, _profile) : params,
           'id': id,
         }),
       );
@@ -913,14 +1046,16 @@ class WsClient {
       );
     }
     final params = <String, dynamic>{'request_id': requestId, 'answer': answer};
-    if (questionId != null && questionId.trim().isNotEmpty) {
+    final hasQuestionId = questionId != null && questionId.trim().isNotEmpty;
+    if (hasQuestionId) {
       params['question_id'] = questionId;
     }
-    final response = await send('clarify.respond', params);
+    final method = hasQuestionId ? 'clarify.lock' : 'clarify.respond';
+    final response = await send(method, params);
     final error = response['error'];
     if (error != null) {
       throw _gatewayResponseError(
-        'clarify.respond',
+        method,
         error,
         fallbackMessage: 'Gateway clarification failed',
       );
@@ -985,6 +1120,9 @@ class WsClient {
       inflight: rawInflight is Map
           ? Map<String, dynamic>.from(rawInflight)
           : null,
+      openRequests: payload['open_requests'] is List
+          ? List<dynamic>.from(payload['open_requests'] as List)
+          : const [],
     );
   }
 

@@ -307,12 +307,16 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
   int _historyGeneration = 0;
   int _responseGeneration = 0;
   bool _approvalDialogOpen = false;
+  bool _approvalRouteOpen = false;
+  String? _activeApprovalServerRequestId;
+  final Set<String> _cancelledInteractiveRequestIds = {};
   final List<_PendingSensitivePrompt> _sensitivePromptQueue = [];
   final Set<String> _expiredSensitivePromptIds = {};
   _PendingSensitivePrompt? _activeSensitivePrompt;
   bool _sensitivePromptRouteOpen = false;
   final List<_PendingClarifyPrompt> _clarifyPromptQueue = [];
   _PendingClarifyPrompt? _activeClarifyPrompt;
+  bool _clarifyPromptRouteOpen = false;
 
   // Voice input / spoken replies
   final FlutterTts _flutterTts = FlutterTts();
@@ -2505,6 +2509,10 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
       _expireSensitivePrompt(event);
       return;
     }
+    if (event.type == 'request.cancel') {
+      _cancelGatewayServerRequest(event);
+      return;
+    }
     if (event.type == 'message.delta') {
       final token = event.data['text']?.toString() ?? '';
       if (token.isEmpty) return;
@@ -2579,6 +2587,17 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
 
   void _handleDesktopAsyncEvent(String mobileSessionId, StreamEvent event) {
     if (!mounted || mobileSessionId != widget.session.id) return;
+    const interactiveTypes = {
+      'approval.request',
+      'clarify.request',
+      'sudo.request',
+      'secret.request',
+      'request.cancel',
+    };
+    if (interactiveTypes.contains(event.type)) {
+      _handleDesktopGatewayEvent(event, _responseGeneration);
+      return;
+    }
     if (_handlePendingReattachTerminalEvent(event)) return;
     if (event.type == 'notification.show') {
       final notification = GatewayNotification.fromEventData(event.data);
@@ -2714,19 +2733,29 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
   ) {
     if (_approvalDialogOpen) return;
     final request = GatewayApprovalRequest.fromEventData(eventData);
+    final rawServerRequestId = eventData['server_request_id']
+        ?.toString()
+        .trim();
+    final serverRequestId = rawServerRequestId?.isEmpty == true
+        ? null
+        : rawServerRequestId;
     _approvalDialogOpen = true;
+    _activeApprovalServerRequestId = serverRequestId;
 
     WidgetsBinding.instance.addPostFrameCallback((_) async {
       if (!mounted || responseGeneration != _responseGeneration) {
         _approvalDialogOpen = false;
+        _activeApprovalServerRequestId = null;
         return;
       }
       final desktopGateway = _desktopGateway;
       if (desktopGateway == null) {
         _approvalDialogOpen = false;
+        _activeApprovalServerRequestId = null;
         return;
       }
 
+      _approvalRouteOpen = true;
       final responded = await showDialog<bool>(
         context: context,
         barrierDismissible: false,
@@ -2738,13 +2767,20 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
           ),
         ),
       );
+      _approvalRouteOpen = false;
       _approvalDialogOpen = false;
+      final wasCancelled =
+          serverRequestId != null &&
+          _cancelledInteractiveRequestIds.remove(serverRequestId);
+      _activeApprovalServerRequestId = null;
       _drainClarifyPromptQueue();
       _drainSensitivePromptQueue();
 
       // System Back is treated as a denial. This prevents a dismissed mobile
-      // dialog from leaving the gateway turn blocked indefinitely.
+      // dialog from leaving the gateway turn blocked indefinitely. A gateway
+      // cancellation closes the same route but must not emit a late denial.
       if (responded != true &&
+          !wasCancelled &&
           mounted &&
           responseGeneration == _responseGeneration) {
         try {
@@ -2887,6 +2923,41 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
     }
   }
 
+  void _cancelGatewayServerRequest(StreamEvent event) {
+    final requestId = event.data['id']?.toString().trim() ?? '';
+    final method = event.data['method']?.toString().trim() ?? '';
+    if (requestId.isEmpty) return;
+
+    if (method == 'sudo' || method == 'secret') {
+      _expireSensitivePrompt(
+        StreamEvent(type: '$method.expire', data: {'request_id': requestId}),
+      );
+      return;
+    }
+
+    _cancelledInteractiveRequestIds.add(requestId);
+    if (method == 'clarify') {
+      _clarifyPromptQueue.removeWhere(
+        (pending) => pending.request.requestId == requestId,
+      );
+      if (_activeClarifyPrompt?.request.requestId == requestId &&
+          _clarifyPromptRouteOpen) {
+        Navigator.of(context, rootNavigator: true).pop(false);
+      } else if (_activeClarifyPrompt?.request.requestId != requestId) {
+        _cancelledInteractiveRequestIds.remove(requestId);
+      }
+      return;
+    }
+
+    if (method == 'approval') {
+      if (_activeApprovalServerRequestId == requestId && _approvalRouteOpen) {
+        Navigator.of(context, rootNavigator: true).pop(false);
+      } else if (_activeApprovalServerRequestId != requestId) {
+        _cancelledInteractiveRequestIds.remove(requestId);
+      }
+    }
+  }
+
   void _queueClarifyPrompt(
     Map<String, dynamic> eventData,
     int responseGeneration,
@@ -2936,6 +3007,7 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
         return;
       }
 
+      _clarifyPromptRouteOpen = true;
       final responded = await showDialog<bool>(
         context: context,
         barrierDismissible: true,
@@ -2948,6 +3020,10 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
           ),
         ),
       );
+      _clarifyPromptRouteOpen = false;
+      final wasCancelled = _cancelledInteractiveRequestIds.remove(
+        pending.request.requestId,
+      );
       if (_activeClarifyPrompt?.request.identityKey ==
           pending.request.identityKey) {
         _activeClarifyPrompt = null;
@@ -2955,8 +3031,10 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
 
       // System Back or a barrier dismiss maps to the official empty answer,
       // matching Hermes Desktop's Skip behavior. Batch questions skip
-      // per-question so the remaining questions can still be answered.
+      // per-question so the remaining questions can still be answered. A
+      // gateway cancellation closes the same route without answering it.
       if (responded != true &&
+          !wasCancelled &&
           mounted &&
           pending.responseGeneration == _responseGeneration) {
         try {
