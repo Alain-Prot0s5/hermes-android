@@ -697,7 +697,7 @@ class DesktopGatewayClient {
   /// never retried here — no auto-resubmit of an uncertain turn.
   static bool _submitNeverReachedTheWire(Object error) {
     if (error is _SubmitTransportGone) return true;
-    return !(error is JsonRpcError) &&
+    return error is! JsonRpcError &&
         error.toString().toLowerCase().contains('not connected');
   }
 
