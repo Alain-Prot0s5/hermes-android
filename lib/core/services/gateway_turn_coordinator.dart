@@ -827,7 +827,9 @@ class GatewayTurnCoordinator {
       inheritedStreamListener?.call(event);
       _observeSocketAction(client, () => _handleLiveEvent(client, event));
     };
+    final inheritedConnectionListener = client.onConnectionChanged;
     client.onConnectionChanged = (connected) {
+      inheritedConnectionListener?.call(connected);
       if (!connected) {
         _observeSocketAction(client, () => _markTransportLost(client));
       }

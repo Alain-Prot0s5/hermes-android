@@ -4,6 +4,8 @@ import 'dart:io';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:hermes_android/core/models/connection.dart';
 import 'package:hermes_android/core/services/desktop_gateway_client.dart';
+import 'package:hermes_android/core/services/gateway_turn_application_controller.dart';
+import 'package:hermes_android/core/services/gateway_turn_journal.dart';
 import 'package:hermes_android/core/services/ws_client.dart';
 
 void main() {
@@ -147,7 +149,7 @@ void main() {
         events
             .lastWhere((event) => event.type == 'approval.request')
             .data['server_request_id'],
-        'srq-approval',
+        endsWith(':srq-approval'),
       );
       await client.respondToApproval(sessionId: 'mobile-1', choice: 'deny');
       await _waitFor(() => gateway.serverResponses.containsKey('srq-approval'));
@@ -167,13 +169,12 @@ void main() {
       await _waitFor(
         () => events.any((event) => event.type == 'secret.request'),
       );
-      expect(
-        events
-            .lastWhere((event) => event.type == 'secret.request')
-            .data['request_id'],
-        'srq-secret',
-      );
-      await client.respondToSecret(requestId: 'srq-secret', value: 'value');
+      final secretRequestId = events
+          .lastWhere((event) => event.type == 'secret.request')
+          .data['request_id']
+          .toString();
+      expect(secretRequestId, endsWith(':srq-secret'));
+      await client.respondToSecret(requestId: secretRequestId, value: 'value');
       await _waitFor(() => gateway.serverResponses.containsKey('srq-secret'));
       expect(gateway.serverResponses['srq-secret']?['result'], {
         'value': 'value',
@@ -192,8 +193,12 @@ void main() {
       await _waitFor(
         () => events.any((event) => event.type == 'clarify.request'),
       );
+      final clarifyRequestId = events
+          .lastWhere((event) => event.type == 'clarify.request')
+          .data['request_id']
+          .toString();
       await client.respondToClarify(
-        requestId: 'srq-clarify',
+        requestId: clarifyRequestId,
         questionId: 'q1',
         answer: 'Yes',
       );
@@ -203,6 +208,516 @@ void main() {
         'question_id': 'q1',
         'answer': 'Yes',
       });
+    },
+  );
+
+  test(
+    'application recovery socket routes requests and responses end to end',
+    () async {
+      final gateway = await _ServerRequestGateway.start(
+        withDashboardAuth: true,
+        withTurnRecovery: true,
+      );
+      addTearDown(gateway.stop);
+      final controller = GatewayTurnApplicationController(
+        journalFactory: () => GatewayTurnJournal(store: _MemoryJournalStore()),
+      );
+      addTearDown(controller.close);
+      final session = controller.sessionFor(
+        SavedConnection(
+          id: 'recovery-server-request-test',
+          label: 'Local fixture',
+          host: 'localhost',
+          port: gateway.port,
+          apiKey: 'fixture-key',
+          useHttps: false,
+          desktopGatewayUrl: 'http://127.0.0.1:${gateway.port}',
+          dashboardUsername: 'user',
+          dashboardPassword: 'pass',
+        ),
+      );
+      final events = <StreamEvent>[];
+      final registration = session.setAsyncEventListener(
+        'mobile-1',
+        (_, event) => events.add(event),
+      );
+
+      await session.submit(localSessionId: 'mobile-1', text: 'Hello');
+      expect(gateway.socketCount, 1);
+
+      gateway.sendServerRequest(
+        id: 'recovery-clarify',
+        method: 'clarify',
+        params: {
+          'session_id': 'runtime-1',
+          'questions': [
+            {'qid': 'q1', 'question': 'Proceed?'},
+          ],
+        },
+      );
+      await _waitFor(
+        () => events.any((event) => event.type == 'clarify.request'),
+      );
+      expect(
+        await session.tryRespondToClarify(
+          requestId: events
+              .lastWhere((event) => event.type == 'clarify.request')
+              .data['request_id']
+              .toString(),
+          questionId: 'q1',
+          answer: 'Yes',
+        ),
+        isTrue,
+      );
+      await _waitFor(() => gateway.clarifyLocks.isNotEmpty);
+      expect(gateway.clarifyLocks.single['answer'], 'Yes');
+      expect(
+        events.any(
+          (event) =>
+              event.type == 'clarify.remaining' &&
+              (event.data['remaining'] as List).isEmpty,
+        ),
+        isTrue,
+      );
+
+      for (final request in <({String id, String method})>[
+        (id: 'recovery-approval', method: 'approval'),
+        (id: 'recovery-sudo', method: 'sudo'),
+        (id: 'recovery-secret', method: 'secret'),
+      ]) {
+        gateway.sendServerRequest(
+          id: request.id,
+          method: request.method,
+          params: {
+            'session_id': 'runtime-1',
+            if (request.method == 'approval') ...{
+              'request_id': 'approval-1',
+              'command': 'echo ok',
+              'choices': ['once', 'deny'],
+            },
+            if (request.method == 'sudo') 'prompt': 'Password',
+            if (request.method == 'secret') ...{
+              'env_var': 'TOKEN',
+              'prompt': 'Token',
+            },
+          },
+        );
+      }
+      await _waitFor(
+        () =>
+            events.any((event) => event.type == 'approval.request') &&
+            events.any((event) => event.type == 'sudo.request') &&
+            events.any((event) => event.type == 'secret.request'),
+      );
+      gateway.sendServerRequest(
+        id: 'recovery-approval-concurrent',
+        method: 'approval',
+        params: {
+          'session_id': 'runtime-1',
+          'request_id': 'approval-2',
+          'command': 'echo concurrent',
+          'choices': ['once', 'deny'],
+        },
+      );
+      await _waitFor(
+        () =>
+            gateway.serverResponses.containsKey('recovery-approval-concurrent'),
+      );
+      expect(
+        gateway.serverResponses['recovery-approval-concurrent']?['error'],
+        containsPair('code', -32601),
+      );
+      expect(
+        events.where((event) => event.type == 'approval.request'),
+        hasLength(1),
+      );
+      expect(
+        await session.tryRespondToApproval(
+          sessionId: 'mobile-1',
+          choice: 'once',
+          requestId: events
+              .lastWhere((event) => event.type == 'approval.request')
+              .data['server_request_id']
+              .toString(),
+        ),
+        isTrue,
+      );
+      expect(
+        await session.tryRespondToSudo(
+          requestId: events
+              .lastWhere((event) => event.type == 'sudo.request')
+              .data['request_id']
+              .toString(),
+          password: 'sudo-value',
+        ),
+        isTrue,
+      );
+      expect(
+        await session.tryRespondToSecret(
+          requestId: events
+              .lastWhere((event) => event.type == 'secret.request')
+              .data['request_id']
+              .toString(),
+          value: 'secret-value',
+        ),
+        isTrue,
+      );
+      await _waitFor(
+        () => gateway.serverResponses.keys.toSet().containsAll({
+          'recovery-approval',
+          'recovery-sudo',
+          'recovery-secret',
+        }),
+      );
+      expect(gateway.serverResponses['recovery-approval']?['result'], {
+        'choice': 'once',
+      });
+      expect(gateway.serverResponses['recovery-sudo']?['result'], {
+        'value': 'sudo-value',
+      });
+      expect(gateway.serverResponses['recovery-secret']?['result'], {
+        'value': 'secret-value',
+      });
+      expect(gateway.serverResponseSocketIndexes['recovery-approval'], 0);
+      expect(gateway.serverResponseSocketIndexes['recovery-sudo'], 0);
+      expect(gateway.serverResponseSocketIndexes['recovery-secret'], 0);
+      expect(gateway.clarifyLockSocketIndexes.single, 0);
+
+      final staleSecondEvents = <StreamEvent>[];
+      final staleSecondRegistration = session.setAsyncEventListener(
+        'mobile-2',
+        (_, event) => staleSecondEvents.add(event),
+      );
+      await session.submit(localSessionId: 'mobile-2', text: 'Hello again');
+      expect(gateway.socketCount, 2);
+      gateway.sendServerRequest(
+        id: 'recovery-replayed',
+        method: 'secret',
+        socketIndex: 1,
+        params: {
+          'session_id': 'runtime-2',
+          'env_var': 'REPLAYED_TOKEN',
+          'prompt': 'Replayed token',
+        },
+      );
+      await _waitFor(
+        () => staleSecondEvents.any(
+          (event) =>
+              event.type == 'secret.request' &&
+              event.data['request_id'].toString().endsWith(
+                ':recovery-replayed',
+              ),
+        ),
+      );
+      final secondEvents = <StreamEvent>[];
+      session.setAsyncEventListener(
+        'mobile-2',
+        (_, event) => secondEvents.add(event),
+      );
+      await _waitFor(
+        () => secondEvents.any(
+          (event) =>
+              event.type == 'secret.request' &&
+              event.data['request_id'].toString().endsWith(
+                ':recovery-replayed',
+              ),
+        ),
+      );
+      session.removeAsyncEventListener('mobile-2', staleSecondRegistration);
+      final replayedRequestId = secondEvents
+          .lastWhere(
+            (event) =>
+                event.type == 'secret.request' &&
+                event.data['request_id'].toString().endsWith(
+                  ':recovery-replayed',
+                ),
+          )
+          .data['request_id']
+          .toString();
+      expect(
+        await session.tryRespondToSecret(
+          requestId: replayedRequestId,
+          value: 'replayed-value',
+        ),
+        isTrue,
+      );
+      await _waitFor(
+        () => gateway.serverResponses.containsKey('recovery-replayed'),
+      );
+      final staleEventCount = staleSecondEvents.length;
+
+      gateway.sendServerRequest(
+        id: 'recovery-second-secret',
+        method: 'secret',
+        socketIndex: 1,
+        params: {
+          'session_id': 'runtime-2',
+          'env_var': 'SECOND_TOKEN',
+          'prompt': 'Second token',
+        },
+      );
+      await _waitFor(
+        () => secondEvents.any(
+          (event) =>
+              event.type == 'secret.request' &&
+              event.data['request_id'].toString().endsWith(
+                ':recovery-second-secret',
+              ),
+        ),
+      );
+      expect(staleSecondEvents, hasLength(staleEventCount));
+      expect(
+        await session.tryRespondToSecret(
+          requestId: secondEvents
+              .lastWhere(
+                (event) =>
+                    event.type == 'secret.request' &&
+                    event.data['request_id'].toString().endsWith(
+                      ':recovery-second-secret',
+                    ),
+              )
+              .data['request_id']
+              .toString(),
+          value: 'second-value',
+        ),
+        isTrue,
+      );
+      await _waitFor(
+        () => gateway.serverResponses.containsKey('recovery-second-secret'),
+      );
+      expect(gateway.serverResponseSocketIndexes['recovery-second-secret'], 1);
+
+      for (var socketIndex = 0; socketIndex < 2; socketIndex++) {
+        gateway.sendServerRequest(
+          id: 'shared-request-id',
+          method: 'secret',
+          socketIndex: socketIndex,
+          params: {
+            'session_id': 'runtime-${socketIndex + 1}',
+            'env_var': 'SHARED_TOKEN',
+            'prompt': 'Shared token',
+          },
+        );
+      }
+      await _waitFor(
+        () =>
+            events.any(
+              (event) =>
+                  event.type == 'secret.request' &&
+                  event.data['request_id'].toString().endsWith(
+                    ':shared-request-id',
+                  ),
+            ) &&
+            secondEvents.any(
+              (event) =>
+                  event.type == 'secret.request' &&
+                  event.data['request_id'].toString().endsWith(
+                    ':shared-request-id',
+                  ),
+            ),
+      );
+      final firstSharedRequestId = events
+          .lastWhere(
+            (event) =>
+                event.type == 'secret.request' &&
+                event.data['request_id'].toString().endsWith(
+                  ':shared-request-id',
+                ),
+          )
+          .data['request_id']
+          .toString();
+      final secondSharedRequestId = secondEvents
+          .lastWhere(
+            (event) =>
+                event.type == 'secret.request' &&
+                event.data['request_id'].toString().endsWith(
+                  ':shared-request-id',
+                ),
+          )
+          .data['request_id']
+          .toString();
+      expect(firstSharedRequestId, isNot(secondSharedRequestId));
+      expect(
+        await session.tryRespondToSecret(
+          requestId: firstSharedRequestId,
+          value: 'first-shared-value',
+        ),
+        isTrue,
+      );
+      expect(
+        await session.tryRespondToSecret(
+          requestId: secondSharedRequestId,
+          value: 'second-shared-value',
+        ),
+        isTrue,
+      );
+      await _waitFor(
+        () => gateway.serverResponseSocketKeys.containsAll({
+          '0:shared-request-id',
+          '1:shared-request-id',
+        }),
+      );
+
+      final thirdOldEvents = <StreamEvent>[];
+      final thirdOldRegistration = session.setAsyncEventListener(
+        'mobile-3',
+        (_, event) => thirdOldEvents.add(event),
+      );
+      await session.submit(localSessionId: 'mobile-3', text: 'Third session');
+      expect(gateway.socketCount, 3);
+      gateway.sendServerRequest(
+        id: 'partial-clarify',
+        method: 'clarify',
+        socketIndex: 2,
+        params: {
+          'session_id': 'runtime-3',
+          'questions': [
+            {'qid': 'q1', 'question': 'First?'},
+            {'qid': 'q2', 'question': 'Second?'},
+          ],
+        },
+      );
+      await _waitFor(
+        () => thirdOldEvents.any((event) => event.type == 'clarify.request'),
+      );
+      final partialRequestId = thirdOldEvents
+          .lastWhere((event) => event.type == 'clarify.request')
+          .data['request_id']
+          .toString();
+      expect(
+        await session.tryRespondToClarify(
+          requestId: partialRequestId,
+          questionId: 'q1',
+          answer: 'First answer',
+        ),
+        isTrue,
+      );
+      await _waitFor(
+        () => thirdOldEvents.any(
+          (event) =>
+              event.type == 'clarify.remaining' &&
+              (event.data['remaining'] as List).contains('q2'),
+        ),
+      );
+      final thirdReplacementEvents = <StreamEvent>[];
+      final thirdReplacementRegistration = session.setAsyncEventListener(
+        'mobile-3',
+        (_, event) => thirdReplacementEvents.add(event),
+      );
+      session.removeAsyncEventListener('mobile-3', thirdOldRegistration);
+      await _waitFor(
+        () => thirdReplacementEvents.any(
+          (event) => event.type == 'clarify.request',
+        ),
+      );
+      final replayedPartial = thirdReplacementEvents.lastWhere(
+        (event) => event.type == 'clarify.request',
+      );
+      expect(replayedPartial.data['questions'], [
+        {'qid': 'q2', 'question': 'Second?'},
+      ]);
+      expect(
+        await session.tryRespondToClarify(
+          requestId: replayedPartial.data['request_id'].toString(),
+          questionId: 'q2',
+          answer: 'Second answer',
+        ),
+        isTrue,
+      );
+      session.removeAsyncEventListener(
+        'mobile-3',
+        thirdReplacementRegistration,
+      );
+
+      gateway.sendServerRequest(
+        id: 'recovery-pending-detach',
+        method: 'secret',
+        params: {
+          'session_id': 'runtime-1',
+          'env_var': 'PENDING_TOKEN',
+          'prompt': 'Pending token',
+        },
+      );
+      await _waitFor(
+        () => events.any(
+          (event) =>
+              event.type == 'secret.request' &&
+              event.data['request_id'].toString().endsWith(
+                ':recovery-pending-detach',
+              ),
+        ),
+      );
+      session.removeAsyncEventListener('mobile-1', registration);
+      await _waitFor(
+        () => gateway.serverResponses.containsKey('recovery-pending-detach'),
+      );
+      expect(
+        gateway.serverResponses['recovery-pending-detach']?['error'],
+        containsPair('code', -32601),
+      );
+      gateway.sendServerRequest(
+        id: 'recovery-detached',
+        method: 'secret',
+        params: {
+          'session_id': 'runtime-1',
+          'env_var': 'DETACHED_TOKEN',
+          'prompt': 'Detached token',
+        },
+      );
+      await _waitFor(
+        () => gateway.serverResponses.containsKey('recovery-detached'),
+      );
+      expect(
+        gateway.serverResponses['recovery-detached']?['error'],
+        containsPair('code', -32601),
+      );
+
+      gateway.sendServerRequest(
+        id: 'recovery-disconnected',
+        method: 'approval',
+        socketIndex: 1,
+        params: {
+          'session_id': 'runtime-2',
+          'request_id': 'approval-disconnected',
+          'command': 'echo disconnected',
+          'choices': ['once', 'deny'],
+        },
+      );
+      await _waitFor(
+        () => secondEvents.any(
+          (event) =>
+              event.type == 'approval.request' &&
+              event.data['server_request_id'].toString().endsWith(
+                ':recovery-disconnected',
+              ),
+        ),
+      );
+      final disconnectedRequestId = secondEvents
+          .lastWhere(
+            (event) =>
+                event.type == 'approval.request' &&
+                event.data['server_request_id'].toString().endsWith(
+                  ':recovery-disconnected',
+                ),
+          )
+          .data['server_request_id']
+          .toString();
+      await gateway.closeSocket(1);
+      await _waitFor(
+        () => secondEvents.any(
+          (event) =>
+              event.type == 'request.cancel' &&
+              event.data['id'] == disconnectedRequestId,
+        ),
+      );
+      expect(
+        await session.tryRespondToApproval(
+          sessionId: 'mobile-2',
+          choice: 'once',
+        ),
+        isFalse,
+      );
+      expect(gateway.serverResponses, isNot(contains('recovery-disconnected')));
     },
   );
 
@@ -243,16 +758,13 @@ void main() {
 
       await client.ensureSession('stored-1');
       await _waitFor(
-        () => events.any(
-          (event) =>
-              event.type == 'secret.request' &&
-              event.data['request_id'] == 'srq-resumed-secret',
-        ),
+        () => events.any((event) => event.type == 'secret.request'),
       );
-      await client.respondToSecret(
-        requestId: 'srq-resumed-secret',
-        value: 'value',
-      );
+      final resumedRequestId = events
+          .lastWhere((event) => event.type == 'secret.request')
+          .data['request_id']
+          .toString();
+      await client.respondToSecret(requestId: resumedRequestId, value: 'value');
       await _waitFor(
         () => gateway.serverResponses.containsKey('srq-resumed-secret'),
       );
@@ -312,7 +824,7 @@ void main() {
       ]);
 
       await client.respondToClarify(
-        requestId: 'srq-resumed-clarify',
+        requestId: event.data['request_id'].toString(),
         questionId: 'q2',
         answer: 'No',
       );
@@ -343,27 +855,35 @@ class _ServerRequestGateway {
   _ServerRequestGateway(
     this._server,
     this.withDashboardAuth,
+    this.withTurnRecovery,
     this.openRequestsOnResume,
   );
 
   final HttpServer _server;
   final bool withDashboardAuth;
+  final bool withTurnRecovery;
   final List<Map<String, dynamic>>? openRequestsOnResume;
   final List<WebSocket> _sockets = [];
   final List<Map<String, dynamic>> capabilityFrames = [];
   final Map<String, Map<String, dynamic>> serverResponses = {};
+  final Map<String, int> serverResponseSocketIndexes = {};
+  final Set<String> serverResponseSocketKeys = {};
   final List<Map<String, dynamic>> clarifyLocks = [];
+  final List<int> clarifyLockSocketIndexes = [];
 
   int get port => _server.port;
+  int get socketCount => _sockets.length;
 
   static Future<_ServerRequestGateway> start({
     bool withDashboardAuth = false,
+    bool withTurnRecovery = false,
     List<Map<String, dynamic>>? openRequestsOnResume,
   }) async {
     final server = await HttpServer.bind(InternetAddress.loopbackIPv4, 0);
     final gateway = _ServerRequestGateway(
       server,
       withDashboardAuth,
+      withTurnRecovery,
       openRequestsOnResume,
     );
     server.listen(gateway._handleHttp);
@@ -403,7 +923,15 @@ class _ServerRequestGateway {
       jsonEncode({
         'jsonrpc': '2.0',
         'method': 'event',
-        'params': {'type': 'gateway.ready', 'payload': {}},
+        'params': {
+          'type': 'gateway.ready',
+          'payload': {
+            if (withTurnRecovery) ...{
+              'protocol': {'name': 'hermes-jsonrpc', 'major': 2},
+              'capabilities': {'turn_recovery': _turnRecoveryCapability()},
+            },
+          },
+        },
       }),
     );
     socket.listen((raw) => _handleSocketFrame(socket, raw));
@@ -411,10 +939,13 @@ class _ServerRequestGateway {
 
   void _handleSocketFrame(WebSocket socket, dynamic raw) {
     final frame = Map<String, dynamic>.from(jsonDecode(raw as String) as Map);
+    final socketIndex = _sockets.indexOf(socket);
     final method = frame['method'];
     final id = frame['id'];
     if (method == null && id is String) {
       serverResponses[id] = frame;
+      serverResponseSocketIndexes[id] = socketIndex;
+      serverResponseSocketKeys.add('$socketIndex:$id');
       return;
     }
     if (method == 'client.capabilities') {
@@ -442,9 +973,41 @@ class _ServerRequestGateway {
       });
       return;
     }
+    if (method == 'session.open') {
+      final params = Map<String, dynamic>.from(frame['params'] as Map);
+      _respond(socket, id, {
+        'runtime_session_id': 'runtime-${socketIndex + 1}',
+        'stored_session_id': 'stored-${socketIndex + 1}',
+        'mobile_session_id': params['mobile_session_id'],
+        'binding_version': 1,
+        'turn_recovery': true,
+        'automatic_resubmit': false,
+        'capabilities': {'turn_recovery': _turnRecoveryCapability()},
+      });
+      return;
+    }
+    if (method == 'prompt.submit') {
+      final params = Map<String, dynamic>.from(frame['params'] as Map);
+      _respond(socket, id, {
+        'accepted': true,
+        'automatic_resubmit': false,
+        'client_turn_id': params['client_turn_id'],
+        'turn_id': 'turn-${socketIndex + 1}',
+        'status': 'accepted',
+        'last_seq': 0,
+        'created': true,
+      });
+      return;
+    }
     if (method == 'clarify.lock') {
-      clarifyLocks.add(Map<String, dynamic>.from(frame['params'] as Map));
-      _respond(socket, id, {'status': 'ok', 'remaining': <String>[]});
+      final params = Map<String, dynamic>.from(frame['params'] as Map);
+      clarifyLocks.add(params);
+      clarifyLockSocketIndexes.add(socketIndex);
+      final isPartialFixture = params['request_id'] == 'partial-clarify';
+      final remaining = isPartialFixture && params['question_id'] == 'q1'
+          ? <String>['q2']
+          : <String>[];
+      _respond(socket, id, {'status': 'ok', 'remaining': remaining});
       return;
     }
     if (method == 'gateway.ping') {
@@ -458,8 +1021,9 @@ class _ServerRequestGateway {
     required String id,
     required String method,
     required Map<String, dynamic> params,
+    int socketIndex = 0,
   }) {
-    final socket = _sockets.single;
+    final socket = _sockets[socketIndex];
     socket.add(
       jsonEncode({
         'jsonrpc': '2.0',
@@ -469,6 +1033,9 @@ class _ServerRequestGateway {
       }),
     );
   }
+
+  Future<void> closeSocket(int socketIndex) =>
+      _sockets[socketIndex].close(WebSocketStatus.goingAway, 'fixture close');
 
   void _respond(WebSocket socket, dynamic id, Map<String, dynamic> result) {
     socket.add(jsonEncode({'jsonrpc': '2.0', 'id': id, 'result': result}));
@@ -491,4 +1058,48 @@ class _ServerRequestGateway {
     _sockets.clear();
     await _server.close(force: true);
   }
+}
+
+Map<String, dynamic> _turnRecoveryCapability() => {
+  'version': 2,
+  'shadow_only': false,
+  'methods': ['session.open', 'turn.reconcile', 'turn.interrupt'],
+  'prompt_submit_version': 2,
+  'applies_to': [
+    'session.open',
+    'prompt.submit@2',
+    'turn.reconcile',
+    'turn.interrupt',
+  ],
+  'automatic_resubmit': false,
+  'execution_route': 'single_process_in_process',
+  'event_retention_seconds': 86400,
+  'turn_retention_seconds': 604800,
+  'max_event_bytes': 65536,
+  'max_turn_bytes': 4194304,
+  'terminal_event_reserve_bytes': 1024,
+  'max_prompt_bytes': 65536,
+  'mobile_session_id_format': 'canonical_lowercase_uuid',
+  'client_turn_id_format': 'canonical_lowercase_uuid',
+  'reconcile_max_events': 256,
+  'reconcile_max_page_bytes': 524288,
+};
+
+class _MemoryJournalStore implements GatewayTurnJournalStore {
+  String? value;
+
+  @override
+  Future<void> delete() async => value = null;
+
+  @override
+  Future<void> deleteLegacy() async {}
+
+  @override
+  Future<String?> read() async => value;
+
+  @override
+  Future<String?> readLegacy() async => null;
+
+  @override
+  Future<void> write(String next) async => value = next;
 }

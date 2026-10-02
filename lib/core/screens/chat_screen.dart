@@ -255,6 +255,7 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
   late final Future<void> _sessionModelRestore;
   DesktopGatewayClient? _desktopGateway;
   GatewayTurnApplicationSession? _turnApplicationSession;
+  Object? _turnApplicationAsyncEventRegistration;
   DesktopConnectionState _desktopConnectionState =
       DesktopConnectionState.disconnected;
   bool _appInBackground = false;
@@ -412,6 +413,11 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
         (_desktopGateway != null
             ? widget.turnApplicationController?.sessionFor(widget.connection)
             : null);
+    final turnApplicationSession = _turnApplicationSession;
+    if (turnApplicationSession != null) {
+      _turnApplicationAsyncEventRegistration = turnApplicationSession
+          .setAsyncEventListener(widget.session.id, _handleDesktopAsyncEvent);
+    }
     _turnApplicationSession?.onTurnSettled = _onTurnSettled;
     unawaited(_initializeChat());
     _loadVerboseMode();
@@ -474,6 +480,13 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
     );
     _desktopGateway?.setAsyncEventListener(null);
     _desktopGateway?.close();
+    final registration = _turnApplicationAsyncEventRegistration;
+    if (registration != null) {
+      _turnApplicationSession?.removeAsyncEventListener(
+        widget.session.id,
+        registration,
+      );
+    }
     _textController.dispose();
     _scrollController.removeListener(_onScroll);
     _scrollController.dispose();
@@ -2501,6 +2514,10 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
       _queueClarifyPrompt(event.data, responseGeneration);
       return;
     }
+    if (event.type == 'clarify.remaining') {
+      _reconcileClarifyPrompts(event);
+      return;
+    }
     if (event.type == 'sudo.request' || event.type == 'secret.request') {
       _queueSensitivePrompt(event, responseGeneration);
       return;
@@ -2590,6 +2607,7 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
     const interactiveTypes = {
       'approval.request',
       'clarify.request',
+      'clarify.remaining',
       'sudo.request',
       'secret.request',
       'request.cancel',
@@ -2727,6 +2745,89 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
     _scheduleStreamingFollow();
   }
 
+  Future<void> _respondToGatewayApproval(
+    String choice, {
+    String? requestId,
+  }) async {
+    final handled =
+        await _turnApplicationSession?.tryRespondToApproval(
+          sessionId: widget.session.id,
+          choice: choice,
+          requestId: requestId,
+        ) ??
+        false;
+    if (handled) return;
+    final gateway = _desktopGateway;
+    if (gateway == null) {
+      throw StateError('The Desktop gateway session is no longer connected');
+    }
+    await gateway.respondToApproval(
+      sessionId: widget.session.id,
+      choice: choice,
+      serverRequestId: requestId,
+    );
+  }
+
+  Future<void> _respondToGatewayClarify({
+    required String requestId,
+    required String answer,
+    String? questionId,
+  }) async {
+    final handled =
+        await _turnApplicationSession?.tryRespondToClarify(
+          requestId: requestId,
+          answer: answer,
+          questionId: questionId,
+        ) ??
+        false;
+    if (handled) return;
+    final gateway = _desktopGateway;
+    if (gateway == null) {
+      throw StateError('The Desktop gateway session is no longer connected');
+    }
+    await gateway.respondToClarify(
+      requestId: requestId,
+      answer: answer,
+      questionId: questionId,
+    );
+  }
+
+  Future<void> _respondToGatewaySudo({
+    required String requestId,
+    required String password,
+  }) async {
+    final handled =
+        await _turnApplicationSession?.tryRespondToSudo(
+          requestId: requestId,
+          password: password,
+        ) ??
+        false;
+    if (handled) return;
+    final gateway = _desktopGateway;
+    if (gateway == null) {
+      throw StateError('The Desktop gateway session is no longer connected');
+    }
+    await gateway.respondToSudo(requestId: requestId, password: password);
+  }
+
+  Future<void> _respondToGatewaySecret({
+    required String requestId,
+    required String value,
+  }) async {
+    final handled =
+        await _turnApplicationSession?.tryRespondToSecret(
+          requestId: requestId,
+          value: value,
+        ) ??
+        false;
+    if (handled) return;
+    final gateway = _desktopGateway;
+    if (gateway == null) {
+      throw StateError('The Desktop gateway session is no longer connected');
+    }
+    await gateway.respondToSecret(requestId: requestId, value: value);
+  }
+
   void _showGatewayApproval(
     Map<String, dynamic> eventData,
     int responseGeneration,
@@ -2766,9 +2867,9 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
         barrierDismissible: false,
         builder: (dialogContext) => GatewayApprovalDialog(
           request: request,
-          onRespond: (choice) => desktopGateway.respondToApproval(
-            sessionId: widget.session.id,
-            choice: choice.wireValue,
+          onRespond: (choice) => _respondToGatewayApproval(
+            choice.wireValue,
+            requestId: serverRequestId,
           ),
         ),
       );
@@ -2789,9 +2890,9 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
           mounted &&
           responseGeneration == _responseGeneration) {
         try {
-          await desktopGateway.respondToApproval(
-            sessionId: widget.session.id,
-            choice: GatewayApprovalChoice.deny.wireValue,
+          await _respondToGatewayApproval(
+            GatewayApprovalChoice.deny.wireValue,
+            requestId: serverRequestId,
           );
         } catch (error) {
           if (!mounted) return;
@@ -2864,11 +2965,11 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
         builder: (_) => GatewaySensitivePromptDialog(
           request: pending.request,
           onRespond: (value) => switch (pending.request.kind) {
-            GatewaySensitivePromptKind.sudo => desktopGateway.respondToSudo(
+            GatewaySensitivePromptKind.sudo => _respondToGatewaySudo(
               requestId: pending.request.requestId,
               password: value,
             ),
-            GatewaySensitivePromptKind.secret => desktopGateway.respondToSecret(
+            GatewaySensitivePromptKind.secret => _respondToGatewaySecret(
               requestId: pending.request.requestId,
               value: value,
             ),
@@ -2888,13 +2989,13 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
         try {
           switch (pending.request.kind) {
             case GatewaySensitivePromptKind.sudo:
-              await desktopGateway.respondToSudo(
+              await _respondToGatewaySudo(
                 requestId: pending.request.requestId,
                 password: '',
               );
               break;
             case GatewaySensitivePromptKind.secret:
-              await desktopGateway.respondToSecret(
+              await _respondToGatewaySecret(
                 requestId: pending.request.requestId,
                 value: '',
               );
@@ -2963,6 +3064,31 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
     }
   }
 
+  void _reconcileClarifyPrompts(StreamEvent event) {
+    final requestId = event.data['id']?.toString().trim() ?? '';
+    final rawRemaining = event.data['remaining'];
+    if (requestId.isEmpty || rawRemaining is! List) return;
+    final remaining = rawRemaining.map((value) => value.toString()).toSet();
+    _clarifyPromptQueue.removeWhere(
+      (pending) =>
+          pending.request.requestId == requestId &&
+          !remaining.contains(pending.request.questionId),
+    );
+    final active = _activeClarifyPrompt;
+    if (active?.request.requestId != requestId ||
+        remaining.contains(active?.request.questionId)) {
+      return;
+    }
+    _cancelledInteractiveRequestIds.add(requestId);
+    if (_clarifyPromptRouteOpen) {
+      Navigator.of(context, rootNavigator: true).pop(false);
+    } else {
+      _activeClarifyPrompt = null;
+      _cancelledInteractiveRequestIds.remove(requestId);
+      _drainClarifyPromptQueue();
+    }
+  }
+
   void _queueClarifyPrompt(
     Map<String, dynamic> eventData,
     int responseGeneration,
@@ -3019,7 +3145,7 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
         barrierDismissible: true,
         builder: (_) => GatewayClarifyDialog(
           request: pending.request,
-          onRespond: (answer) => desktopGateway.respondToClarify(
+          onRespond: (answer) => _respondToGatewayClarify(
             requestId: pending.request.requestId,
             questionId: pending.request.questionId,
             answer: answer,
@@ -3044,7 +3170,7 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
           mounted &&
           pending.responseGeneration == _responseGeneration) {
         try {
-          await desktopGateway.respondToClarify(
+          await _respondToGatewayClarify(
             requestId: pending.request.requestId,
             questionId: pending.request.questionId,
             answer: '',

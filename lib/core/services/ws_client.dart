@@ -195,8 +195,8 @@ class GatewayServerRequest {
   final String method;
   final Map<String, dynamic> params;
   final bool replayed;
-  final void Function(Map<String, dynamic> result) _respond;
-  final void Function(int code, String message) _fail;
+  final bool Function(Map<String, dynamic> result) _respond;
+  final bool Function(int code, String message) _fail;
   bool _settled = false;
 
   GatewayServerRequest._({
@@ -208,16 +208,18 @@ class GatewayServerRequest {
     required this._fail,
   });
 
-  void respond(Map<String, dynamic> result) {
-    if (_settled) return;
+  bool respond(Map<String, dynamic> result) {
+    if (_settled) return false;
+    if (!_respond(result)) return false;
     _settled = true;
-    _respond(result);
+    return true;
   }
 
-  void fail(int code, String message) {
-    if (_settled) return;
+  bool fail(int code, String message) {
+    if (_settled) return false;
+    if (!_fail(code, message)) return false;
     _settled = true;
-    _fail(code, message);
+    return true;
   }
 }
 
@@ -254,6 +256,7 @@ class WsClient {
   StreamCallback? onStreamEvent;
   ServerRequestCallback? onServerRequest;
   ConnectionCallback? onConnectionChanged;
+  void Function()? onConnectionClosed;
   GatewayReadyCallback? onGatewayReady;
 
   factory WsClient(
@@ -403,6 +406,11 @@ class WsClient {
       }
     }
     if (wasConnected) {
+      try {
+        onConnectionClosed?.call();
+      } catch (_) {
+        // Cleanup observers cannot keep a rejected socket logically active.
+      }
       try {
         onConnectionChanged?.call(false);
       } catch (_) {
@@ -646,13 +654,13 @@ class WsClient {
     }
   }
 
-  void _sendServerResponse(
+  bool _sendServerResponse(
     String id, {
     Map<String, dynamic>? result,
     Map<String, dynamic>? error,
   }) {
     final channel = _channel;
-    if (channel == null || channel.closeCode != null) return;
+    if (channel == null || channel.closeCode != null) return false;
     channel.sink.add(
       jsonEncode({
         'jsonrpc': '2.0',
@@ -660,6 +668,7 @@ class WsClient {
         if (error != null) 'error': error else 'result': result ?? const {},
       }),
     );
+    return true;
   }
 
   void _handleGatewayReady(Map<String, dynamic> data, int generation) {
@@ -1036,7 +1045,7 @@ class WsClient {
     );
   }
 
-  Future<void> respondToClarify({
+  Future<Map<String, dynamic>> respondToClarify({
     required String requestId,
     required String answer,
     String? questionId,
@@ -1067,6 +1076,10 @@ class WsClient {
         fallbackMessage: 'Gateway clarification failed',
       );
     }
+    final rawResult = response['result'];
+    return rawResult is Map
+        ? Map<String, dynamic>.from(rawResult)
+        : const <String, dynamic>{};
   }
 
   Future<void> _respondToSensitivePrompt({
