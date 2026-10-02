@@ -1183,9 +1183,35 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
         _applyGatewayTurnState(state);
       }
       if (states.isEmpty && _activeClientTurnId == null) {
+        // Journal recovery only knows the turns this client submitted. A turn
+        // that another surface started leaves no journal entry here, so ask
+        // the gateway before showing the chat as idle: otherwise the composer
+        // looks free while a turn is still running, and a send lands inside it.
+        var runningElsewhere = false;
+        final desktopGateway = _desktopGateway;
+        if (desktopGateway != null) {
+          try {
+            runningElsewhere = await desktopGateway.reportsRunningTurn(
+              widget.session.id,
+            );
+          } catch (_) {
+            runningElsewhere = false;
+          }
+        }
+        if (!mounted) return;
         setState(() {
-          _sending = false;
-          _gatewayTurnStatus = null;
+          if (runningElsewhere) {
+            _activeResponseTransport = _ResponseTransport.desktop;
+            _sending = true;
+            _streaming = true;
+            _gatewayTurnStatus = const GatewayTurnStatus(
+              kind: 'recovery',
+              text: 'Hermes is responding…',
+            );
+          } else {
+            _sending = false;
+            _gatewayTurnStatus = null;
+          }
         });
       }
     } catch (error) {

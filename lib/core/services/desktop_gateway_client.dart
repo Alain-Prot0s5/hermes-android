@@ -43,6 +43,11 @@ class DesktopGatewayClient {
   bool _closed = false;
   final Map<String, String> _gatewaySessionIds = {};
   final Map<String, String> _storedSessionIds = {};
+
+  /// Last `session.resume` payload per chat, kept so the UI can ask whether the
+  /// gateway is mid-turn in a chat whose turn this client never submitted.
+  final Map<String, ResumedGatewaySession?> _resumeStates = {};
+
   final Map<String, String> _workingDirectories = {};
   DesktopAsyncEventCallback? _asyncEventListener;
   DesktopConnectionCallback? _connectionListener;
@@ -407,6 +412,7 @@ class DesktopGatewayClient {
     _gatewaySessionIds[mobileSessionId] = binding.runtimeSessionId;
     _storedSessionIds[mobileSessionId] = binding.storedSessionId;
     final resumed = binding.resumed;
+    _resumeStates[mobileSessionId] = resumed;
     final inflight = resumed?.inflight;
     final error = inflight?['error']?.toString().trim() ?? '';
     final status = (inflight?['status'] ?? resumed?.status)
@@ -450,6 +456,49 @@ class DesktopGatewayClient {
   /// resume); mobile ids do not survive into gateway-side lookups.
   String? storedSessionKeyFor(String mobileSessionId) =>
       _storedSessionIds[mobileSessionId];
+
+  /// True when the gateway reported an in-flight turn for this chat the last
+  /// time it was bound.
+  ///
+  /// Turn recovery on this client is journal-driven, so it only knows the
+  /// turns *this* client submitted. A turn started on another surface (desktop
+  /// or TUI) leaves no journal entry, and a chat re-opened on the phone would
+  /// then render as idle while the gateway is still mid-turn — with a composer
+  /// that accepts a prompt into the running turn. `session.resume` already
+  /// carries the answer (`running`, `inflight.status`), so ask it before
+  /// declaring the chat idle. `_connect` returns the cached binding for an
+  /// already-bound chat, so this costs no extra resume.
+  Future<bool> reportsRunningTurn(String mobileSessionId) async {
+    try {
+      await _connect(mobileSessionId);
+    } catch (_) {
+      // Unknown transport state must not wedge the composer.
+      return false;
+    }
+    final resumed = _resumeStates[mobileSessionId];
+    if (resumed == null) return false;
+    final status = (resumed.inflight?['status'] ?? resumed.status)
+        ?.toString()
+        .trim()
+        .toLowerCase();
+    const terminalStatuses = {
+      'completed',
+      'error',
+      'failed',
+      'interrupted',
+      'cancelled',
+      'canceled',
+    };
+    if (status != null &&
+        status.isNotEmpty &&
+        terminalStatuses.contains(status)) {
+      return false;
+    }
+    return resumed.running == true ||
+        status == 'running' ||
+        status == 'waiting_input';
+  }
+
 
   /// True when [error] says the runtime session id the gateway was handed no
   /// longer exists — the detached/orphan-reap or eviction signature. The
