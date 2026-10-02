@@ -82,6 +82,83 @@ class GatewayNoticeCard extends StatelessWidget {
   }
 }
 
+/// A gateway record the human never typed: compaction handoffs, background
+/// task notices, model/personality switches.
+///
+/// The server marks these with `display_kind` on a `role: user` row, so a
+/// bubble that trusts `role` alone shows them as the user's own words — a
+/// 31K-character compaction handoff looks like a message the user has no
+/// memory of sending. Nothing is hidden here: the full text stays readable,
+/// collapsed by default, with the real author named in the header.
+class SystemRecordCard extends StatelessWidget {
+  final String displayKind;
+  final String content;
+
+  const SystemRecordCard({
+    required this.displayKind,
+    required this.content,
+    super.key,
+  });
+
+  /// Header for a record kind. Content sniffing covers the kinds this client
+  /// does not know yet (the gateway may add more), so an unrecognised record
+  /// still gets an honest label instead of a blank card.
+  static String labelFor(String kind, String content) {
+    final head = content.trimLeft();
+    if (head.startsWith('[CONTEXT COMPACTION')) {
+      return 'Context compaction summary';
+    }
+    if (head.startsWith('[IMPORTANT:') ||
+        head.contains('Background process')) {
+      return 'Background task notice';
+    }
+    return switch (kind) {
+      'model_switch' => 'Model switch',
+      'personality_switch' => 'Personality switch',
+      'hidden' => 'Internal record',
+      'async_delegation_complete' => 'Task completion notice',
+      _ => 'System record',
+    };
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+    final label = labelFor(displayKind, content);
+    return Card(
+      margin: const EdgeInsets.symmetric(horizontal: 16, vertical: 4),
+      color: theme.colorScheme.surfaceContainerHighest,
+      child: ExpansionTile(
+        leading: const Icon(Icons.memory_outlined, size: 21),
+        title: Text(label, style: theme.textTheme.labelLarge),
+        subtitle: Text(
+          '${content.length} chars · tap to read',
+          style: theme.textTheme.bodySmall,
+        ),
+        childrenPadding: const EdgeInsets.fromLTRB(16, 0, 16, 14),
+        children: [
+          Row(
+            children: [
+              Expanded(
+                child: Text(
+                  'Not written by you — sent by the gateway.',
+                  style: theme.textTheme.bodySmall?.copyWith(
+                    color: theme.colorScheme.onSurfaceVariant,
+                  ),
+                ),
+              ),
+            ],
+          ),
+          const SizedBox(height: 8),
+          SelectionArea(
+            child: Text(content, style: theme.textTheme.bodySmall),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
 class GatewaySubagentCard extends StatelessWidget {
   final List<GatewaySubagentActivity> activities;
 

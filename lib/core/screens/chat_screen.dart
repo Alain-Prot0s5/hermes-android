@@ -3667,6 +3667,22 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
                 (msg['_display_content'] as String?) ??
                 stripToolResultText(messageContentToText(msg['content']));
             final isUser = role == 'user';
+            // A `role: user` row with a display_kind was authored by the
+            // gateway, not the human (compaction handoffs, background-task
+            // notices, model/personality switches). Rendering it as a user
+            // bubble makes a 31K-character handoff look like a message the
+            // user has no memory of sending. `steer` is excluded: that one is
+            // genuinely the user's own mid-turn message.
+            final displayKind = (msg['display_kind'] as String?)?.trim();
+            if (isUser &&
+                displayKind != null &&
+                displayKind.isNotEmpty &&
+                displayKind != 'steer') {
+              return SystemRecordCard(
+                displayKind: displayKind,
+                content: content,
+              );
+            }
 
             return MessageBubble(
               content: content,
