@@ -954,9 +954,35 @@ class WsClient {
     }
   }
 
+  /// Bound for `session.resume`, which returns the retained transcript.
+  ///
+  /// [send]'s 30s default is sized for control calls; a multi-megabyte
+  /// transcript over a relayed mobile link needs far longer before the client
+  /// is entitled to call it failed.
+  static const Duration resumeTimeout = Duration(seconds: 180);
+
   /// Resume an existing session while preserving retained turn state.
+  ///
+  /// Resuming only binds retained state — it never executes a turn — so a
+  /// dropped socket is retried once before surfacing a failure. Without this,
+  /// a reconnect that is already in flight shows up as a failed send in the
+  /// composer.
   Future<ResumedGatewaySession> resumeSessionDetails(String sessionId) async {
-    final result = await send('session.resume', {'session_id': sessionId});
+    Map<String, dynamic> result;
+    try {
+      result = await send(
+        'session.resume',
+        {'session_id': sessionId},
+        timeout: resumeTimeout,
+      );
+    } catch (_) {
+      await Future<void>.delayed(const Duration(seconds: 2));
+      result = await send(
+        'session.resume',
+        {'session_id': sessionId},
+        timeout: resumeTimeout,
+      );
+    }
     if (result['error'] != null) {
       throw _gatewayResponseError(
         'session.resume',

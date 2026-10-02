@@ -634,6 +634,13 @@ class ApiClient {
   /// uses this bound so the user always gets a loadable error state.
   static const Duration requestTimeout = Duration(seconds: 20);
 
+  /// Bound for reads that can carry a whole transcript.
+  ///
+  /// A long session's history is multi-megabyte; on a mobile or relayed link
+  /// the 20s bound above is far too tight and surfaces as a failed load, which
+  /// makes an otherwise reachable gateway look dead on 5G.
+  static const Duration historyTimeout = Duration(seconds: 180);
+
   // Keep the public parameter name `apiKey` while storing it privately.
   ApiClient({
     required String baseUrl,
@@ -705,7 +712,7 @@ class ApiClient {
           Uri.parse('$baseUrl/api/sessions/$sessionId/messages'),
           headers: _headers,
         )
-        .timeout(requestTimeout);
+        .timeout(historyTimeout);
     if (res.statusCode != 200) {
       throw Exception('HTTP ${res.statusCode}: ${res.body}');
     }
