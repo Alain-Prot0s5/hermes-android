@@ -2195,7 +2195,19 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
             }
             return testUpload(draft: draft, dataUrl: dataUrl);
           }
-          return _uploadAttachmentDraft(desktopGateway, draft, dataUrl);
+          // A mobile link drops mid-upload (NAT rebind, radio handover,
+          // phone sleep) and the whole send aborts before the prompt is even
+          // submitted — exactly what "Upload failed" plus a transport error in
+          // the composer was. One bounded retry after a short pause, same as
+          // the tile's manual retry, keeps the draft and its text; anything
+          // that is not a transport-level failure propagates unchanged.
+          try {
+            return await _uploadAttachmentDraft(desktopGateway, draft, dataUrl);
+          } catch (error) {
+            if (!_isTransientUploadFailure(error)) rethrow;
+            await Future<void>.delayed(const Duration(seconds: 2));
+            return _uploadAttachmentDraft(desktopGateway, draft, dataUrl);
+          }
         },
         onChanged: (draft) {
           if (!mounted || responseGeneration != _responseGeneration) return;
@@ -3308,6 +3320,31 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
     );
   }
 
+  /// Height cap for the attachment tray, measured against what the keyboard
+  /// leaves rather than the full screen: a share of the whole screen is what
+  /// overflowed the composer once the soft keyboard was up with drafts.
+  double _attachmentTrayMaxHeight(BuildContext context) {
+    final media = MediaQuery.of(context);
+    final usable = media.size.height - media.viewInsets.bottom;
+    final cap = usable * 0.32;
+    return cap < 96 ? 96 : cap;
+  }
+
+  /// True for upload failures that mean the bytes never reached the gateway,
+  /// so re-sending them cannot duplicate anything. Mirrors the manual retry
+  /// the attachment tile already offers.
+  static bool _isTransientUploadFailure(Object error) {
+    final text = error.toString().toLowerCase();
+    return text.contains('not connected') ||
+        text.contains('socketexception') ||
+        text.contains('connection closed') ||
+        text.contains('connection reset') ||
+        text.contains('timeout') ||
+        text.contains('timed out') ||
+        text.contains('failed host lookup') ||
+        text.contains('network is unreachable');
+  }
+
   Widget _buildInputBar() {
     return Container(
       key: const Key('chat-input-bar'),
@@ -3399,36 +3436,43 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
               ),
             ),
             if (_attachmentDrafts.isNotEmpty)
-              Container(
-                width: double.infinity,
-                margin: const EdgeInsets.fromLTRB(4, 4, 4, 8),
-                padding: const EdgeInsets.symmetric(vertical: 4),
-                decoration: BoxDecoration(
-                  color: Theme.of(context).colorScheme.surfaceContainerHighest,
-                  borderRadius: BorderRadius.circular(12),
-                ),
-                child: Semantics(
-                  label: 'Attachment drafts',
-                  child: ConstrainedBox(
-                    constraints: BoxConstraints(
-                      maxHeight: MediaQuery.sizeOf(context).height * 0.32,
-                    ),
-                    child: ListView.builder(
-                      shrinkWrap: true,
-                      itemCount: _attachmentDrafts.length,
-                      itemBuilder: (context, index) => AttachmentDraftTile(
-                        draft: _attachmentDrafts[index],
-                        index: index,
-                        total: _attachmentDrafts.length,
-                        busy: _sending,
-                        onMovePrevious: () =>
-                            _moveAttachment(_attachmentDrafts[index], -1),
-                        onMoveNext: () =>
-                            _moveAttachment(_attachmentDrafts[index], 1),
-                        onRetry: () =>
-                            _retryAttachment(_attachmentDrafts[index]),
-                        onRemove: () =>
-                            _removeAttachment(_attachmentDrafts[index]),
+              Flexible(
+                // The tray has to yield to the soft keyboard. Capped only by
+                // 32% of the *screen* it overflowed the composer by ~43 px as
+                // soon as the keyboard came up with drafts attached; inside a
+                // bounded column a loose Flexible lets it shrink instead.
+                fit: FlexFit.loose,
+                child: Container(
+                  width: double.infinity,
+                  margin: const EdgeInsets.fromLTRB(4, 4, 4, 8),
+                  padding: const EdgeInsets.symmetric(vertical: 4),
+                  decoration: BoxDecoration(
+                    color: Theme.of(context).colorScheme.surfaceContainerHighest,
+                    borderRadius: BorderRadius.circular(12),
+                  ),
+                  child: Semantics(
+                    label: 'Attachment drafts',
+                    child: ConstrainedBox(
+                      constraints: BoxConstraints(
+                        maxHeight: _attachmentTrayMaxHeight(context),
+                      ),
+                      child: ListView.builder(
+                        shrinkWrap: true,
+                        itemCount: _attachmentDrafts.length,
+                        itemBuilder: (context, index) => AttachmentDraftTile(
+                          draft: _attachmentDrafts[index],
+                          index: index,
+                          total: _attachmentDrafts.length,
+                          busy: _sending,
+                          onMovePrevious: () =>
+                              _moveAttachment(_attachmentDrafts[index], -1),
+                          onMoveNext: () =>
+                              _moveAttachment(_attachmentDrafts[index], 1),
+                          onRetry: () =>
+                              _retryAttachment(_attachmentDrafts[index]),
+                          onRemove: () =>
+                              _removeAttachment(_attachmentDrafts[index]),
+                        ),
                       ),
                     ),
                   ),
