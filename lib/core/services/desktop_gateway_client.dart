@@ -636,15 +636,81 @@ class DesktopGatewayClient {
     required StreamCallback onEvent,
     required void Function() onSent,
   }) async {
-    await _callSessionScoped(
-      sessionId,
-      (gateway) => gateway.client.submitPrompt(
-        text,
-        sessionId: gateway.sessionId,
-        onEvent: onEvent,
-        onSent: onSent,
-      ),
-    );
+    for (var attempt = 0; attempt < 2; attempt++) {
+      try {
+        await _callSessionScoped(
+          sessionId,
+          (gateway) async {
+            // Detect a socket that is already gone *before* writing the
+            // prompt: `WsClient.send` only refuses when it knows the transport
+            // dropped, so a half-open link (mobile NAT rebind, phone sleep)
+            // would otherwise swallow the submit and leave the turn's fate
+            // unknown for the whole submit timeout.
+            if (!await _probeTransport(gateway.client)) {
+              throw const _SubmitTransportGone();
+            }
+            return gateway.client.submitPrompt(
+              text,
+              sessionId: gateway.sessionId,
+              onEvent: onEvent,
+              onSent: onSent,
+            );
+          },
+        );
+        return;
+      } catch (error) {
+        if (attempt == 0 && _submitNeverReachedTheWire(error)) {
+          await _rebuildSocket();
+          continue;
+        }
+        rethrow;
+      }
+    }
+  }
+
+  /// Probe the live socket with a cheap RPC.
+  ///
+  /// Returns true when the socket answered anything at all: a stock gateway
+  /// replying "method not found" still proves the transport works, so only its
+  /// own timeout (or a refusal) counts as gone.
+  Future<bool> _probeTransport(WsClient client) async {
+    try {
+      await client.send(
+        'ping',
+        const <String, dynamic>{},
+        timeout: const Duration(seconds: 5),
+      );
+      return true;
+    } on JsonRpcError catch (error) {
+      return !error.message.toLowerCase().contains('timeout');
+    } catch (_) {
+      return false;
+    }
+  }
+
+  /// True when [error] proves the prompt never reached the wire.
+  ///
+  /// Only two cases qualify: our own probe reporting the transport gone, and
+  /// `WsClient.send` refusing with "Not connected" before it writes anything.
+  /// Every other failure (a JSON-RPC error, a submit that timed out, a socket
+  /// closed after the write) may already be running server-side, so it is
+  /// never retried here — no auto-resubmit of an uncertain turn.
+  static bool _submitNeverReachedTheWire(Object error) {
+    if (error is _SubmitTransportGone) return true;
+    return !(error is JsonRpcError) &&
+        error.toString().toLowerCase().contains('not connected');
+  }
+
+  /// Drop the current socket and bring up a fresh one, waiting for its
+  /// `gateway.ready` before returning. Stored session ids survive, so the
+  /// caller's next scoped call re-resumes its runtime binding.
+  Future<void> _rebuildSocket() async {
+    final existing = _ws;
+    _ws = null;
+    _socketInFlight = null;
+    _gatewaySessionIds.clear();
+    existing?.close();
+    await _ensureSocket();
   }
 
   /// Receives durable session-scoped events plus terminal turn frames.
@@ -841,6 +907,17 @@ String documentIntakeProfileForConnection(SavedConnection connection) {
     return 'pro';
   }
   return 'organizator';
+}
+
+/// Raised when the transport probe proves the gateway socket is gone before a
+/// prompt is written. Local to this file: it must stay distinguishable from a
+/// gateway-answered [JsonRpcError], because only a local transport failure
+/// proves the prompt was never submitted (and is therefore safe to retry).
+class _SubmitTransportGone implements Exception {
+  const _SubmitTransportGone();
+
+  @override
+  String toString() => 'SubmitTransportGone';
 }
 
 class _DesktopGatewaySession {
